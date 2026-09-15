@@ -108,16 +108,15 @@ function tryLogin(){
   }).catch(function(e){setLoginErr('登录失败：'+(e&&e.message||e));});
 }
 function _doFirstTime(pwd){
-  return _genSalt().then(function(salt){
-    return _deriveKey(pwd,salt).then(function(key){
-      _cloudKey=key;_cloudSalt=salt;
-      _rememberKey(key);
-      return _encrypt(key,JSON.stringify(APP)).then(function(enc){
-        return _cloudUpsert(salt,enc.iv,enc.data).then(function(){
-          document.getElementById('loginBg').classList.remove('on');
-          document.getElementById('statusBar').textContent='云端已初始化，本地数据已上传';
-          renderCriteria();render();updateUncStats();
-        });
+  var salt=_genSalt();
+  return _deriveKey(pwd,salt).then(function(key){
+    _cloudKey=key;_cloudSalt=salt;
+    _rememberKey(key);
+    return _encrypt(key,JSON.stringify(APP)).then(function(enc){
+      return _cloudUpsert(salt,enc.iv,enc.data).then(function(){
+        document.getElementById('loginBg').classList.remove('on');
+        document.getElementById('statusBar').textContent='云端已初始化，本地数据已上传';
+        renderCriteria();render();updateUncStats();
       });
     });
   });
