@@ -12,11 +12,17 @@
   <div class="topbar-brand"><h1>🏛 党员发展积分管理系统 <span class="tag">国际交流学院</span></h1></div>
   <div class="topbar-actions">
     <button type="button" class="topbar-unc hide" id="globalUncBadge" title="点击查看不确定项">待处理 0 项</button>
-    <button class="btn btn-o" id="btnTpl">📥 模板</button>
     <button class="btn btn-o" id="btnExport">📤 导出汇总</button>
-    <button class="btn btn-o" id="btnBackup">📦 备份</button>
-    <button class="btn btn-o" id="btnRestore" style="position:relative">📥 恢复<input type="file" id="restoreFile" accept=".json" style="position:absolute;left:0;top:0;width:100%;height:100%;opacity:0;cursor:pointer"></button>
+    <span class="export-hint hide" id="exportHint"></span>
     <button class="btn btn-p" id="btnSaveAll">💾 保存</button>
+    <div class="topbar-more">
+      <button type="button" class="btn btn-o" id="btnMore">⋮ 更多</button>
+      <div class="topbar-more-menu" id="topbarMoreMenu">
+        <button class="btn" id="btnTpl">📥 下载模板</button>
+        <button class="btn" id="btnBackup">📦 备份数据</button>
+        <button class="btn" id="btnRestore" style="position:relative">📥 恢复数据<input type="file" id="restoreFile" accept=".json" style="position:absolute;left:0;top:0;width:100%;height:100%;opacity:0;cursor:pointer"></button>
+      </div>
+    </div>
   </div>
 </div>
 <div class="app">
@@ -60,6 +66,11 @@
 </div>
 <div class="main-content hide" id="viewSummary">
   <button class="btn btn-p" id="btnBackSummary" style="margin-bottom:14px">← 返回个人视图</button>
+  <div class="mode-switch-bar" id="modeSwitchBar">
+    <span class="mode-switch-label">视图模式：</span>
+    <button class="mode-btn active" id="btnModeDetail">📋 明细模式</button>
+    <button class="mode-btn" id="btnModeSimple">📊 简洁总分</button>
+  </div>
   <div class="tbl-wrap"><table class="tbl" id="summaryTable"></table></div>
 </div>
 <div class="main-content hide" id="viewPersonal">
@@ -103,7 +114,11 @@
 </div>
 <div class="modal-bg" id="modalBg"><div class="modal-box" id="modalBox"></div></div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
-<div class="status"><span id="statusBar">系统就绪 v10</span></div>
+<div class="status hide" aria-hidden="true"><span id="statusBar">系统就绪 v10</span></div>
 <script src="app.js"></script>
+<script>
+document.getElementById('btnMore').addEventListener('click',function(e){e.stopPropagation();document.getElementById('topbarMoreMenu').classList.toggle('open');});
+document.addEventListener('click',function(e){if(!e.target.closest('.topbar-more'))document.getElementById('topbarMoreMenu').classList.remove('open');});
+</script>
 </body>
 </html>
