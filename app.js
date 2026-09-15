@@ -2,6 +2,145 @@
 var LEGACY_STORE='pps_v9';
 var APP_SCHEMA_VERSION=10;
 var _toastTimer=null;
+/* ── 云同步配置（腾讯云开发 CloudBase）────────────────────────
+   1. 到 https://cloud.tencent.com 开通「云开发 CloudBase」，创建环境；
+   2. 在控制台拿到「环境 ID」（形如 xxx-1g2h3j4k）填到下面 env；
+   3. 控制台「登录授权」里开启「匿名登录」；
+   4. 数据库新建集合（默认名 app_state），权限设为「所有用户可读可写」；
+   5. 把网站域名加进「Web 安全域名」；
+   6. enabled 设为 true 即可启用多设备同步。
+   说明：共享密码用于加密数据，云端只存密文，无密码读不到内容。
+   ──────────────────────────────────────────────────────── */
+var CLOUD={
+  enabled:true,
+  env:'partypoints-d3g5gwtnz48e590fa',
+  collection:'app_state'
+};
+var CLOUD_ENABLED=false;
+var _cloudApp=null,_cloudKey=null,_cloudSalt=null,_cloudBusy=false,_cloudDirty=false;
+if(CLOUD.enabled&&CLOUD.env&&typeof cloudbase!=='undefined'){
+  try{_cloudApp=cloudbase.init({env:CLOUD.env});CLOUD_ENABLED=true;}catch(e){console.error('cloudbase init failed',e);}
+}
+/* ── 加解密工具（Web Crypto：PBKDF2 派生密钥 + AES-GCM）────── */
+function _bufToB64(buf){var b=new Uint8Array(buf),s='';for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s);}
+function _b64ToBuf(b64){var s=atob(b64),b=new Uint8Array(s.length);for(var i=0;i<s.length;i++)b[i]=s.charCodeAt(i);return b.buffer;}
+function _strToBuf(s){return new TextEncoder().encode(s);}
+function _bufToStr(buf){return new TextDecoder().decode(buf);}
+function _genSalt(){var s=new Uint8Array(16);crypto.getRandomValues(s);return _bufToB64(s.buffer);}
+function _deriveKey(pwd,saltB64){
+  return crypto.subtle.importKey('raw',_strToBuf(pwd),'PBKDF2',false,['deriveKey'])
+    .then(function(base){return crypto.subtle.deriveKey({name:'PBKDF2',salt:_b64ToBuf(saltB64),iterations:100000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);});
+}
+function _encrypt(key,str){
+  var iv=crypto.getRandomValues(new Uint8Array(12));
+  return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},key,_strToBuf(str)).then(function(buf){return {iv:_bufToB64(iv.buffer),data:_bufToB64(buf)};});
+}
+function _decrypt(key,ivB64,dataB64){
+  return crypto.subtle.decrypt({name:'AES-GCM',iv:_b64ToBuf(ivB64)},key,_b64ToBuf(dataB64)).then(function(buf){return _bufToStr(buf);});
+}
+function _exportKey(key){return crypto.subtle.exportKey('jwk',key).then(function(j){return JSON.stringify(j);});}
+function _importKey(jwkStr){return crypto.subtle.importKey('jwk',JSON.parse(jwkStr),{name:'AES-GCM'},false,['encrypt','decrypt']);}
+/* ── 云同步运行时（CloudBase，密码加密）───────────────────── */
+function _cloudLogin(){return _cloudApp.auth().signInAnonymously();}
+function _cloudGet(){
+  return _cloudApp.database().collection(CLOUD.collection).where({key:'main'}).get()
+    .then(function(res){var r=(res&&res.data&&res.data[0])||null;return r;});
+}
+function _cloudUpsert(saltB64,ivB64,dataB64){
+  var col=_cloudApp.database().collection(CLOUD.collection);
+  return _cloudGet().then(function(rec){
+    var fields={key:'main',salt:saltB64,iv:ivB64,data:dataB64,updatedAt:Date.now()};
+    if(rec)return col.doc(rec._id).update(fields);
+    return col.add(fields);
+  });
+}
+function pushCloud(){
+  if(!CLOUD_ENABLED||!_cloudKey)return;
+  if(_cloudBusy){_cloudDirty=true;return;}
+  _cloudBusy=true;
+  _encrypt(_cloudKey,JSON.stringify(APP)).then(function(enc){
+    return _cloudUpsert(_cloudSalt,enc.iv,enc.data);
+  }).then(function(){
+    _cloudBusy=false;
+    if(_cloudDirty){_cloudDirty=false;pushCloud();}
+  }).catch(function(e){
+    _cloudBusy=false;_cloudDirty=false;
+    toast('云端保存失败：'+(e&&e.message||e),'err');
+  });
+}
+function _rememberKey(key){
+  if(window.crypto&&crypto.subtle&&crypto.subtle.exportKey){
+    _exportKey(key).then(function(jwk){try{localStorage.setItem('pps_ck',jwk);}catch(e){}});
+  }
+}
+function _forgetKey(){try{localStorage.removeItem('pps_ck');}catch(e){}}
+function setLoginErr(m){var el=document.getElementById('loginErr');if(el)el.textContent=m||'';}
+function _applyData(data){
+  if(data&&data.rules&&Array.isArray(data.members)){
+    if(!data.schemaVersion)data.schemaVersion=APP_SCHEMA_VERSION;
+    if(!data.criteriaVersion)data.criteriaVersion=APP_SCHEMA_VERSION;
+    if(!data.summaryMode)data.summaryMode='detail';
+    if(!data.learnedMap)data.learnedMap={};
+    APP=data;R=APP.rules;
+    if(APP._sortCol!=null)_sumSortCol=APP._sortCol;
+    if(APP._sortDir!=null)_sumSortDir=APP._sortDir;
+    try{localStorage.setItem(STORE,JSON.stringify(APP));}catch(e){}
+    document.getElementById('statusBar').textContent='已从云端同步';
+  }else{
+    document.getElementById('statusBar').textContent='云端数据为空';
+  }
+  document.getElementById('loginBg').classList.remove('on');
+  renderCriteria();render();updateUncStats();
+}
+function tryLogin(){
+  var pwd=document.getElementById('loginPwd').value.trim();
+  if(!pwd){setLoginErr('请输入共享密码');return;}
+  setLoginErr('');
+  _cloudLogin().then(function(){return _cloudGet();}).then(function(rec){
+    if(!rec){return _doFirstTime(pwd);}
+    return _deriveKey(pwd,rec.salt).then(function(key){
+      return _decrypt(key,rec.iv,rec.data).then(function(plain){
+        _cloudKey=key;_cloudSalt=rec.salt;
+        _rememberKey(key);
+        _applyData(JSON.parse(plain));
+      },function(){setLoginErr('密码错误，请重试');});
+    });
+  }).catch(function(e){setLoginErr('登录失败：'+(e&&e.message||e));});
+}
+function _doFirstTime(pwd){
+  return _genSalt().then(function(salt){
+    return _deriveKey(pwd,salt).then(function(key){
+      _cloudKey=key;_cloudSalt=salt;
+      _rememberKey(key);
+      return _encrypt(key,JSON.stringify(APP)).then(function(enc){
+        return _cloudUpsert(salt,enc.iv,enc.data).then(function(){
+          document.getElementById('loginBg').classList.remove('on');
+          document.getElementById('statusBar').textContent='云端已初始化，本地数据已上传';
+          renderCriteria();render();updateUncStats();
+        });
+      });
+    });
+  });
+}
+function _tryAutoLogin(){
+  var jwk=null;try{jwk=localStorage.getItem('pps_ck');}catch(e){}
+  if(!jwk)return Promise.reject('no-key');
+  return _importKey(jwk).then(function(key){
+    _cloudKey=key;
+    return _cloudLogin();
+  }).then(function(){return _cloudGet();}).then(function(rec){
+    if(!rec)return Promise.reject('no-rec');
+    return _decrypt(_cloudKey,rec.iv,rec.data).then(function(plain){
+      _cloudSalt=rec.salt;
+      _applyData(JSON.parse(plain));
+    });
+  });
+}
+function doLogout(){
+  if(!confirm('退出登录？退出后需重新输入共享密码。'))return;
+  _forgetKey();_cloudKey=null;_cloudSalt=null;
+  location.reload();
+}
 window.addEventListener('error',function(e){if(e.message&&e.message.indexOf('runtime.lastError')>=0){e.preventDefault();}},true);
 /* ── 全局点击关闭悬浮分数卡片兜底 ── */
 document.addEventListener('click',function(e){if(!e.target.closest('.mitem')){var tips=document.querySelectorAll('.member-tooltip');for(var i=0;i<tips.length;i++)tips[i].remove();}});
@@ -96,8 +235,9 @@ function loadApp(){var def={rules:JSON.parse(JSON.stringify(DEF)),members:[],cur
 var DEF={levelAward:{'学科竞赛':{lv:['国家级','省级','市级','校级/协会级','院级'],sc:[8,6,4,3,2],mode:'level'},'创新创业':{lv:['国家级','省级','市级','校级/协会级','院级'],sc:[8,6,4,3,2],mode:'level'},'社会实践成果':{lv:['国家级','省级','市级','校级/协会级','院级'],sc:[8,6,4,3,2],mode:'level'},'奖学金':{lv:['国家奖学金','国家励志奖学金','校一等奖学金','校二等奖学金','校三等奖学金'],sc:[8,6,4,3,2],mode:'level'},'荣誉称号':{lv:['优秀团员/团干/学生骨干','优秀学员','志愿者之星/优秀志愿者','标兵/十佳'],sc:[3,2,2,4],mode:'level'},'体育赛事获奖':{lv:['国家级赛事','省级赛事','市级赛事','校级/协会赛事','院级赛事'],sc:[7,5,3,2,1],mode:'level'},'体育竞赛':{lv:['国家级','省级','市级','校级/协会级','院级'],sc:[7,5,3,2,1],mode:'level'},'志愿服务':{lv:['国家级赛事服务','市级服务','区级服务','校级服务','院级服务'],sc:[8,5,3,2,1],mode:'hourly',rate:0.25,cap:8}},socialWork:{'校级主席/部长':8,'校级副主席/副部长':6,'院级主席/部长':6,'班长/团支书':5,'副班长':4,'其他班委/院级干事/校级干事':3},perActivity:{'党课学习':5,'红心活动':3,'社会实践':5,'国际交流':2,'同辈互助':2},caps:{'国际交流':8,'志愿服务':10},volunteer:{rate:0.5,cap:10},rank:{top5:6,top10:3,top20:1},discipline:{fail:-3,warning:-5,severeWarning:-10,demerit:-20},acCap:40,ptCap:60};
 function ld(k,d){try{var s=localStorage.getItem(k);return s?JSON.parse(s):JSON.parse(JSON.stringify(d));}catch(e){return JSON.parse(JSON.stringify(d));}}
 var _svTimer=null;
-function svNow(){APP.schemaVersion=APP_SCHEMA_VERSION;if(APP.criteriaVersion==null)APP.criteriaVersion=APP_SCHEMA_VERSION;try{localStorage.setItem(STORE,JSON.stringify(APP));}catch(e){toast('保存失败：数据可能过大，请先导出备份','err');}}
-function sv(){APP.schemaVersion=APP_SCHEMA_VERSION;if(APP.criteriaVersion==null)APP.criteriaVersion=APP_SCHEMA_VERSION;clearTimeout(_svTimer);_svTimer=setTimeout(function(){try{localStorage.setItem(STORE,JSON.stringify(APP));}catch(e){toast('保存失败：数据可能过大，请先导出备份','err');}},300);}
+function _writeLocal(){APP.schemaVersion=APP_SCHEMA_VERSION;if(APP.criteriaVersion==null)APP.criteriaVersion=APP_SCHEMA_VERSION;try{localStorage.setItem(STORE,JSON.stringify(APP));}catch(e){toast('保存失败：数据可能过大，请先导出备份','err');}}
+function svNow(){_writeLocal();pushCloud();}
+function sv(){APP.schemaVersion=APP_SCHEMA_VERSION;if(APP.criteriaVersion==null)APP.criteriaVersion=APP_SCHEMA_VERSION;clearTimeout(_svTimer);_svTimer=setTimeout(function(){_writeLocal();pushCloud();},300);}
 window.addEventListener('beforeunload',function(){if(_svTimer){clearTimeout(_svTimer);_svTimer=null;}svNow();});
 var APP=loadApp();
 // 恢复上次排序状态（纯 UI 状态，不影响数据结构）
@@ -609,4 +749,14 @@ dz.addEventListener('drop',function(e){e.preventDefault();this.classList.remove(
   });
 
   if(typeof XLSX=='undefined'){document.getElementById('statusBar').textContent='XLSX库加载失败！';}else{document.getElementById('statusBar').textContent='系统就绪 v'+APP_SCHEMA_VERSION+(APP.criteriaVersion?' · 标准v'+APP.criteriaVersion:'');}
-try{renderCriteria();render();updateUncStats();}catch(e){document.getElementById('statusBar').textContent='初始化错误: '+e.message;console.error(e);}
+/* ── 云同步启动 ── */
+var _btnLogin=document.getElementById('btnLogin'),_btnLogout=document.getElementById('btnLogout'),_loginPwd=document.getElementById('loginPwd');
+if(_btnLogin)_btnLogin.addEventListener('click',tryLogin);
+if(_loginPwd)_loginPwd.addEventListener('keydown',function(e){if(e.key==='Enter')tryLogin();});
+if(_btnLogout)_btnLogout.addEventListener('click',doLogout);
+if(!CLOUD_ENABLED){
+  if(_btnLogout)_btnLogout.style.display='none';
+  try{renderCriteria();render();updateUncStats();}catch(e){document.getElementById('statusBar').textContent='初始化错误: '+e.message;console.error(e);}
+}else{
+  _tryAutoLogin().catch(function(){document.getElementById('loginBg').classList.add('on');});
+}
