@@ -14,7 +14,8 @@ var _toastTimer=null;
 var CLOUD={
   enabled:true,
   env:'partypoints-d3g5gwtnz48e590fa',
-  collection:'app_state'
+  collection:'app_state',
+  adminUid:'2099738603472580610' // Administrator UID in the existing production environment.
 };
 var CLOUD_ENABLED=false;
 var _cloudApp=null,_cloudKey=null,_cloudSalt=null,_cloudBusy=false,_cloudDirty=false;
@@ -27,9 +28,9 @@ function _b64ToBuf(b64){var s=atob(b64),b=new Uint8Array(s.length);for(var i=0;i
 function _strToBuf(s){return new TextEncoder().encode(s);}
 function _bufToStr(buf){return new TextDecoder().decode(buf);}
 function _genSalt(){var s=new Uint8Array(16);crypto.getRandomValues(s);return _bufToB64(s.buffer);}
-function _deriveKey(pwd,saltB64){
+function _deriveKey(pwd,saltB64,exportable){
   return crypto.subtle.importKey('raw',_strToBuf(pwd),'PBKDF2',false,['deriveKey'])
-    .then(function(base){return crypto.subtle.deriveKey({name:'PBKDF2',salt:_b64ToBuf(saltB64),iterations:100000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);});
+    .then(function(base){return crypto.subtle.deriveKey({name:'PBKDF2',salt:_b64ToBuf(saltB64),iterations:100000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},exportable===true,['encrypt','decrypt']);});
 }
 function _encrypt(key,str){
   var iv=crypto.getRandomValues(new Uint8Array(12));
@@ -41,30 +42,71 @@ function _decrypt(key,ivB64,dataB64){
 function _exportKey(key){return crypto.subtle.exportKey('jwk',key).then(function(j){return JSON.stringify(j);});}
 function _importKey(jwkStr){return crypto.subtle.importKey('jwk',JSON.parse(jwkStr),{name:'AES-GCM'},false,['encrypt','decrypt']);}
 /* ── 云同步运行时（CloudBase，密码加密）───────────────────── */
-function _cloudLogin(){return _cloudApp.auth().signInAnonymously();}
-function _cloudGet(){
-  return _cloudApp.database().collection(CLOUD.collection).where({key:'main'}).get()
-    .then(function(res){var r=(res&&res.data&&res.data[0])||null;return r;});
-}
-function _cloudUpsert(saltB64,ivB64,dataB64){
-  var col=_cloudApp.database().collection(CLOUD.collection);
-  return _cloudGet().then(function(rec){
-    var fields={key:'main',salt:saltB64,iv:ivB64,data:dataB64,updatedAt:Date.now()};
-    if(rec)return col.doc(rec._id).update(fields);
-    return col.add(fields);
+function _cloudLogin(){
+  if(!CLOUD.adminUid)return Promise.reject(new Error('尚未配置旧环境管理员用户 ID，请勿发布此版本。'));
+  return _cloudApp.auth().getUserInfo().then(function(user){
+    var uid=user&&(user.uid||user.sub||user.id);
+    if(String(uid||'')!==String(CLOUD.adminUid))throw new Error('请先登录学院管理员账号。');
+    return user;
   });
 }
+var _cloudRecordKey='main';
+var _cloudGuard=CloudSync.create(),_cloudConflict=false,_lastSavedPayload=null,_memberChangeSignatures={};
+async function _cloudGet(){
+  var col=_cloudApp.database().collection(CLOUD.collection);
+  var keys=['main_admin_account_v2','main_admin_recovery_v1','main'];
+  for(var i=0;i<keys.length;i++){
+    var res=await col.where({key:keys[i]}).get();
+    if(res&&res.data&&res.data[0]){_cloudRecordKey=keys[i];return res.data[0];}
+  }
+  _cloudRecordKey='main_admin_account_v2';return null;
+}
+function _adoptCloudRecord(rec){
+  _cloudGuard.adopt(rec);_cloudRecordKey=rec.key;_cloudConflict=false;
+  var banner=document.getElementById('cloudConflictBanner');if(banner)banner.classList.add('hide');
+}
+function _cloudUpsert(saltB64,ivB64,dataB64){
+  if(_cloudConflict)return Promise.reject(new Error('保存冲突尚未处理，请先读取云端最新版。'));
+  if(dataB64.length>950000)return Promise.reject(new Error('数据接近单条记录容量限制，请先导出完整备份，联系维护人员拆分历史记录。'));
+  return _cloudGuard.write(_cloudApp.database().collection(CLOUD.collection),{key:_cloudRecordKey,salt:saltB64,iv:ivB64,data:dataB64,updatedAt:Date.now()});
+}
+function _downloadFullBackup(label){
+  var bk=JSON.parse(JSON.stringify(APP));bk.date=new Date().toISOString();bk.version='v10-workflow1';
+  var blob=new Blob([JSON.stringify(bk,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=url;a.download=(label||'积分备份')+'_'+new Date().toLocaleDateString('sv-SE')+'.json';a.click();setTimeout(function(){URL.revokeObjectURL(url);},1000);
+}
+async function reloadLatestCloud(){
+  if(!_cloudKey)return toast('请先登录。','err');
+  if(_cloudBusy)return toast('正在保存，请稍后再读取。','err');
+  if(!confirm('读取云端最新版前，将下载一份当前本机数据备份。当前未同步修改不会自动合并，请之后按备份核对。继续？'))return;
+  try{
+    var rec=await _cloudGet();if(!rec)throw new Error('未找到云端数据。');
+    var plain=await _decrypt(_cloudKey,rec.iv,rec.data),data=JSON.parse(plain);
+    if(!data||!data.rules||!Array.isArray(data.members))throw new Error('云端数据格式不正确。');
+    _downloadFullBackup('读取云端前的本机备份');
+    clearTimeout(_svTimer);_svTimer=null;_cloudDirty=false;_cloudSalt=rec.salt;
+    _adoptCloudRecord(rec);_applyData(data);toast('已读取云端最新版；如有本机未同步修改，请对照刚下载的备份处理。');
+  }catch(e){toast('读取失败：'+e.message,'err');}
+}
+function _setCloudSaveState(state,message){
+  var el=document.getElementById('cloudSaveState');if(el){el.dataset.state=state;el.textContent=message;}
+}
 function pushCloud(){
-  if(!CLOUD_ENABLED||!_cloudKey)return;
+  if(!CLOUD_ENABLED||!_cloudKey){_setCloudSaveState('local','未登录，仅本机保存');return;}
+  if(_cloudConflict){_setCloudSaveState('error','有保存冲突，未覆盖云端');return;}
   if(_cloudBusy){_cloudDirty=true;return;}
-  _cloudBusy=true;
-  _encrypt(_cloudKey,JSON.stringify(APP)).then(function(enc){
-    return _cloudUpsert(_cloudSalt,enc.iv,enc.data);
-  }).then(function(){
-    _cloudBusy=false;
+  var payload=JSON.stringify(APP);if(payload===_lastSavedPayload){_setCloudSaveState('saved','已保存到云端，无新增修改');return;}
+  _cloudBusy=true;_setCloudSaveState('saving','正在保存到云端…');
+  _encrypt(_cloudKey,payload).then(function(enc){return _cloudUpsert(_cloudSalt,enc.iv,enc.data);}).then(function(){
+    _lastSavedPayload=payload;_cloudBusy=false;
+    _setCloudSaveState('saved','已保存到云端 '+new Date().toLocaleTimeString('zh-CN',{hour12:false}));
     if(_cloudDirty){_cloudDirty=false;pushCloud();}
   }).catch(function(e){
     _cloudBusy=false;_cloudDirty=false;
+    if(e&&e.code==='CLOUD_CONFLICT'){
+      _cloudConflict=true;document.getElementById('cloudConflictBanner').classList.remove('hide');
+      _setCloudSaveState('error','其他电脑有更新，已阻止覆盖');
+    }else _setCloudSaveState('error','云端保存失败，本机修改仍保留');
     toast('云端保存失败：'+(e&&e.message||e),'err');
   });
 }
@@ -73,15 +115,26 @@ function _rememberKey(key){
     _exportKey(key).then(function(jwk){try{localStorage.setItem('pps_ck',jwk);}catch(e){}});
   }
 }
-function _forgetKey(){try{localStorage.removeItem('pps_ck');}catch(e){}}
-function setLoginErr(m){var el=document.getElementById('loginErr');if(el)el.textContent=m||'';}
+var ADMIN_SESSION_STORE='pps_admin_tab_session_v1';
+var ADMIN_SESSION_TTL=8*60*60*1000;
+function _forgetKey(){
+  try{localStorage.removeItem('pps_ck');}catch(e){}
+  try{sessionStorage.removeItem(ADMIN_SESSION_STORE);}catch(e){}
+}
+async function _rememberAdminSession(key,salt){
+  try{
+    var jwk=await _exportKey(key);
+    sessionStorage.setItem(ADMIN_SESSION_STORE,JSON.stringify({uid:String(CLOUD.adminUid),env:CLOUD.env,recordKey:'main_admin_account_v2',salt:salt,jwk:jwk,expiresAt:Date.now()+ADMIN_SESSION_TTL}));
+  }catch(e){toast('本窗口无法保留登录状态，刷新后需重新登录。','err');}
+}
+function setLoginErr(m){var el=document.getElementById('loginErr');if(el){el.textContent=m||'';if(m)el.scrollIntoView({block:'nearest'});}}
 function _applyData(data){
   if(data&&data.rules&&Array.isArray(data.members)){
     if(!data.schemaVersion)data.schemaVersion=APP_SCHEMA_VERSION;
     if(!data.criteriaVersion)data.criteriaVersion=APP_SCHEMA_VERSION;
     if(!data.summaryMode)data.summaryMode='detail';
     if(!data.learnedMap)data.learnedMap={};
-    APP=data;R=APP.rules;
+    APP=data;BatchCore.ensure(APP);AdminCore.ensure(APP);_auditSnapshot=AdminCore.snapshot(APP);R=APP.rules;
     if(APP._sortCol!=null)_sumSortCol=APP._sortCol;
     if(APP._sortDir!=null)_sumSortDir=APP._sortDir;
     try{localStorage.setItem(STORE,JSON.stringify(APP));}catch(e){}
@@ -91,19 +144,21 @@ function _applyData(data){
   }
   document.getElementById('loginBg').classList.remove('on');
   renderCriteria();render();updateUncStats();
+  _resetMemberChangeSignatures();_writeLocal();_lastSavedPayload=JSON.stringify(APP);
+  _setCloudSaveState('saved','已读取云端数据');
 }
-function tryLogin(){
+function unlockCloudData(){
   var pwd=document.getElementById('loginPwd').value.trim();
   if(!pwd){setLoginErr('请输入共享密码');return;}
   setLoginErr('');
   _cloudLogin().then(function(){return _cloudGet();}).then(function(rec){
-    if(!rec){return _doFirstTime(pwd);}
+    if(!rec){throw new Error('旧环境未找到积分数据，已停止，未创建或覆盖数据。');}
     return _deriveKey(pwd,rec.salt).then(function(key){
       return _decrypt(key,rec.iv,rec.data).then(function(plain){
         _cloudKey=key;_cloudSalt=rec.salt;
         _rememberKey(key);
         _applyData(JSON.parse(plain));
-      },function(){setLoginErr('密码错误，请重试');});
+      },function(){setLoginErr('管理员验证已通过，但数据解锁密码不正确。忘记密码可从 JSON 备份恢复。');});
     });
   }).catch(function(e){setLoginErr('登录失败：'+(e&&e.message||e));});
 }
@@ -121,24 +176,93 @@ function _doFirstTime(pwd){
     });
   });
 }
-function _tryAutoLogin(){
-  var jwk=null;try{jwk=localStorage.getItem('pps_ck');}catch(e){}
-  if(!jwk)return Promise.reject('no-key');
-  return _importKey(jwk).then(function(key){
-    _cloudKey=key;
-    return _cloudLogin();
-  }).then(function(){return _cloudGet();}).then(function(rec){
-    if(!rec)return Promise.reject('no-rec');
-    return _decrypt(_cloudKey,rec.iv,rec.data).then(function(plain){
-      _cloudSalt=rec.salt;
-      _applyData(JSON.parse(plain));
-    });
+async function _tryAutoLogin(){
+  var session;
+  try{session=JSON.parse(sessionStorage.getItem(ADMIN_SESSION_STORE)||'null');}catch(e){_forgetKey();return false;}
+  if(!session)return false;
+  if(session.uid!==String(CLOUD.adminUid)||session.env!==CLOUD.env||session.recordKey!=='main_admin_account_v2'||!session.salt||!session.jwk||!Number.isFinite(session.expiresAt)||session.expiresAt<=Date.now()){
+    _forgetKey();setLoginErr('登录已过期，请重新输入管理员账号和密码。');return false;
+  }
+  _adminLoginBusy=true;document.getElementById('btnLogin').disabled=true;
+  setLoginErr('正在恢复登录并读取云端最新数据…');
+  try{
+    await _cloudLogin();
+    var rec=await _cloudGet();
+    if(!rec||rec.key!==session.recordKey||rec.salt!==session.salt)throw new Error('共享数据已变化，请重新登录。');
+    var key=await _importKey(session.jwk),plain=await _decrypt(key,rec.iv,rec.data),data=JSON.parse(plain);
+    if(!data||!data.rules||!Array.isArray(data.members))throw new Error('云端数据格式不正确。');
+    _cloudKey=key;_cloudSalt=rec.salt;_adoptCloudRecord(rec);_applyData(data);setLoginErr('');return true;
+  }catch(e){
+    _cloudKey=null;_cloudSalt=null;_forgetKey();document.getElementById('loginBg').classList.add('on');
+    setLoginErr('登录状态未能恢复，请重新登录。若网络异常，请稍后重试。');return false;
+  }finally{_adminLoginBusy=false;document.getElementById('btnLogin').disabled=false;}
+}
+async function tryLogin(){
+  if(_adminLoginBusy)return;
+  if(!CLOUD.adminUid){setLoginErr('尚未配置管理员 ID。');return;}
+  var username=document.getElementById('loginUsername').value.trim();
+  var password=document.getElementById('loginAccountPwd').value;
+  if(!username||!password){setLoginErr('请输入管理员账号和密码。');return;}
+  _adminLoginBusy=true;document.getElementById('btnLogin').disabled=true;
+  _cloudKey=null;_cloudSalt=null;
+  try{
+    setLoginErr('正在登录…');
+    var result=await _cloudApp.auth().signInWithPassword({username:username,password:password});
+    if(result&&result.error)throw result.error;
+    await _cloudLogin();
+    var rec=await _cloudGet();
+    if(!rec||rec.key!=='main_admin_account_v2'){
+      document.getElementById('recoverySection').open=true;
+      setLoginErr('管理员账号验证成功，但尚未发现新版共享数据。历史数据恢复仅需由维护管理员完成一次，其他电脑无需重复上传。');return;
+    }
+    var key=await _deriveKey(password,rec.salt,true),plain;
+    try{plain=await _decrypt(key,rec.iv,rec.data);}catch(e){
+      throw new Error('账号验证成功，但数据无法解锁。如果管理员密码曾被重置，需要使用备份重新配置；请勿删除云端数据。');
+    }
+    var data=JSON.parse(plain);_cloudKey=key;_cloudSalt=rec.salt;_adoptCloudRecord(rec);
+    _forgetKey();await _rememberAdminSession(key,rec.salt);_applyData(data);document.getElementById('loginAccountPwd').value='';setLoginErr('');
+  }catch(e){setLoginErr('登录失败：'+(e&&e.message||e));}
+  finally{_adminLoginBusy=false;document.getElementById('btnLogin').disabled=false;}
+}
+var _adminLoginBusy=false;
+function doLogout(){
+  if(!confirm('确认退出管理员账号？'))return;
+  clearTimeout(_svTimer);_svTimer=null;
+  _forgetKey();_cloudKey=null;_cloudSalt=null;
+  _cloudApp.auth().signOut().then(function(){location.reload();},function(){
+    document.getElementById('loginBg').classList.add('on');setLoginErr('退出失败，请重试。');
   });
 }
-function doLogout(){
-  if(!confirm('退出登录？退出后需重新输入共享密码。'))return;
-  _forgetKey();_cloudKey=null;_cloudSalt=null;
-  location.reload();
+async function recoverFromBackup(){
+  if(_adminLoginBusy)return;
+  var file=document.getElementById('recoveryFile').files[0];
+  var account=document.getElementById('loginAccountPwd').value;
+  var username=document.getElementById('loginUsername').value.trim();
+  if(!file||!account||!username){setLoginErr('请选择 JSON 备份，并重新填写上方管理员账号和登录密码。');return;}
+  _adminLoginBusy=true;document.getElementById('btnRecover').disabled=true;
+  var saved=false;
+  try{
+    var data=JSON.parse((await file.text()).replace(/^\uFEFF/,''));
+    if(!data||!data.rules||typeof data.rules!=='object'||Array.isArray(data.rules)||!Array.isArray(data.members))throw new Error('备份格式不正确，需要网站导出的完整 JSON 文件。');
+    var result=await _cloudApp.auth().signInWithPassword({username:username,password:account});
+    if(result&&result.error)throw result.error;
+    await _cloudLogin();
+    var col=_cloudApp.database().collection(CLOUD.collection);
+    var existing=await col.where({key:'main_admin_account_v2'}).get();
+    if(existing.data&&existing.data.length)throw new Error('单密码版数据已经存在，已停止，未覆盖。请用管理员账号和密码登录。');
+    if(!confirm('备份包含 '+data.members.length+' 位成员。将创建独立恢复数据，不修改原 main 记录。旧网址仍使用原记录，期间请勿两边同时录入。确认恢复？'))return;
+    var salt=_genSalt(),key=await _deriveKey(account,salt,true);
+    var enc=await _encrypt(key,JSON.stringify(data));
+    var recoveredRecord={_id:'admin_account_v2',key:'main_admin_account_v2',salt:salt,iv:enc.iv,data:enc.data,revision:1,updatedAt:Date.now(),recoveredAt:Date.now()};
+    await col.add(recoveredRecord);_adoptCloudRecord(recoveredRecord);
+    saved=true;_cloudRecordKey='main_admin_account_v2';_cloudKey=key;_cloudSalt=salt;
+    _forgetKey();await _rememberAdminSession(key,salt);_applyData(data);
+    document.getElementById('loginAccountPwd').value='';
+    document.getElementById('statusBar').textContent='已从备份恢复；原云端记录保留。';
+    toast('恢复完成。以后只需管理员账号和密码登录。');
+  }catch(e){
+    setLoginErr((saved?'恢复数据已写入，但显示失败，请刷新后用管理员账号和密码登录：':'恢复未完成：')+(e&&e.message||e));
+  }finally{_adminLoginBusy=false;document.getElementById('btnRecover').disabled=false;}
 }
 window.addEventListener('error',function(e){if(e.message&&e.message.indexOf('runtime.lastError')>=0){e.preventDefault();}},true);
 /* ── 全局点击关闭悬浮分数卡片兜底 ── */
@@ -234,89 +358,134 @@ function loadApp(){var def={rules:JSON.parse(JSON.stringify(DEF)),members:[],cur
 var DEF={levelAward:{'学科竞赛':{lv:['国家级','省级','市级','校级/协会级','院级'],sc:[8,6,4,3,2],mode:'level'},'创新创业':{lv:['国家级','省级','市级','校级/协会级','院级'],sc:[8,6,4,3,2],mode:'level'},'社会实践成果':{lv:['国家级','省级','市级','校级/协会级','院级'],sc:[8,6,4,3,2],mode:'level'},'奖学金':{lv:['国家奖学金','国家励志奖学金','校一等奖学金','校二等奖学金','校三等奖学金'],sc:[8,6,4,3,2],mode:'level'},'荣誉称号':{lv:['优秀团员/团干/学生骨干','优秀学员','志愿者之星/优秀志愿者','标兵/十佳'],sc:[3,2,2,4],mode:'level'},'体育赛事获奖':{lv:['国家级赛事','省级赛事','市级赛事','校级/协会赛事','院级赛事'],sc:[7,5,3,2,1],mode:'level'},'体育竞赛':{lv:['国家级','省级','市级','校级/协会级','院级'],sc:[7,5,3,2,1],mode:'level'},'志愿服务':{lv:['国家级赛事服务','市级服务','区级服务','校级服务','院级服务'],sc:[8,5,3,2,1],mode:'hourly',rate:0.25,cap:8}},socialWork:{'校级主席/部长':8,'校级副主席/副部长':6,'院级主席/部长':6,'班长/团支书':5,'副班长':4,'其他班委/院级干事/校级干事':3},perActivity:{'党课学习':5,'红心活动':3,'社会实践':5,'国际交流':2,'同辈互助':2},caps:{'国际交流':8,'志愿服务':10},volunteer:{rate:0.5,cap:10},rank:{top5:6,top10:3,top20:1},discipline:{fail:-3,warning:-5,severeWarning:-10,demerit:-20},acCap:40,ptCap:60};
 function ld(k,d){try{var s=localStorage.getItem(k);return s?JSON.parse(s):JSON.parse(JSON.stringify(d));}catch(e){return JSON.parse(JSON.stringify(d));}}
 var _svTimer=null;
-function _writeLocal(){APP.schemaVersion=APP_SCHEMA_VERSION;if(APP.criteriaVersion==null)APP.criteriaVersion=APP_SCHEMA_VERSION;try{localStorage.setItem(STORE,JSON.stringify(APP));}catch(e){toast('保存失败：数据可能过大，请先导出备份','err');}}
-function svNow(){_writeLocal();pushCloud();}
-function sv(){APP.schemaVersion=APP_SCHEMA_VERSION;if(APP.criteriaVersion==null)APP.criteriaVersion=APP_SCHEMA_VERSION;clearTimeout(_svTimer);_svTimer=setTimeout(function(){_writeLocal();pushCloud();},300);}
-window.addEventListener('beforeunload',function(){if(_svTimer){clearTimeout(_svTimer);_svTimer=null;}svNow();});
-var APP=loadApp();
+function _memberChangeSignature(m){var copy=Object.assign({},m);delete copy._updatedAt;return BatchCore.signature({members:[copy]});}
+function _resetMemberChangeSignatures(){_memberChangeSignatures={};APP.members.forEach(function(m){_memberChangeSignatures[m._memberId]=_memberChangeSignature(m);});}
+function _touchMemberChanges(){BatchCore.ensure(APP);APP.members.forEach(function(m){var current=_memberChangeSignature(m);if(_memberChangeSignatures[m._memberId]!=null&&_memberChangeSignatures[m._memberId]!==current)m._updatedAt=new Date().toISOString();_memberChangeSignatures[m._memberId]=current;});}
+function _writeLocal(){APP.members.forEach(_captureManualItems);_touchMemberChanges();_auditSnapshot=AdminCore.record(APP,_auditSnapshot);APP.schemaVersion=APP_SCHEMA_VERSION;if(APP.criteriaVersion==null)APP.criteriaVersion=APP_SCHEMA_VERSION;try{localStorage.setItem(STORE,JSON.stringify(APP));}catch(e){toast('保存失败：数据可能过大，请先导出备份','err');}}
+function svNow(){clearTimeout(_svTimer);_svTimer=null;_writeLocal();pushCloud();}
+function sv(){
+  APP.schemaVersion=APP_SCHEMA_VERSION;if(APP.criteriaVersion==null)APP.criteriaVersion=APP_SCHEMA_VERSION;
+  if(CLOUD_ENABLED&&_cloudKey&&!_cloudConflict)_setCloudSaveState('saving','有修改，等待保存到云端…');
+  clearTimeout(_svTimer);_svTimer=setTimeout(function(){_svTimer=null;_writeLocal();pushCloud();},300);
+}
+function _hasPendingCloudChanges(){return !!(CLOUD_ENABLED&&_cloudKey&&(_cloudBusy||_cloudDirty||_cloudConflict||JSON.stringify(APP)!==_lastSavedPayload));}
+window.addEventListener('beforeunload',function(e){
+  clearTimeout(_svTimer);_svTimer=null;_writeLocal();
+  if(_hasPendingCloudChanges()){
+    e.preventDefault();e.returnValue='';
+    if(!_cloudBusy&&!_cloudConflict)pushCloud();
+  }
+});
+
+var APP=loadApp();BatchCore.ensure(APP);AdminCore.ensure(APP);var _auditSnapshot=AdminCore.snapshot(APP);_resetMemberChangeSignatures();
 // 恢复上次排序状态（纯 UI 状态，不影响数据结构）
 if(APP._sortCol!=null)_sumSortCol=APP._sortCol;
 if(APP._sortDir!=null)_sumSortDir=APP._sortDir;
-var R=APP.rules;var AC=['学业成绩','综合测评','社会工作','学科竞赛','创新创业','奖学金/荣誉'];var PS=['党课学习','志愿服务','红心活动','社会实践','国际交流','同辈互助'];var DS=['不当言论','挂科','无故缺席','网络违纪','纪律处分','一票否决'];var ALL_LV=['国家级','省级','市级','校级/协会级','院级'];
+var R=APP.rules;var AC=['学业成绩','综合测评','社会工作','学科竞赛','创新创业','奖学金/荣誉'];var PS=['党课学习','志愿服务','红心活动','社会实践','国际交流','同辈互助'];var DS=['不当言论','挂科','无故缺席','网络违纪','纪律处分'];var ALL_LV=['国家级','省级','市级','校级/协会级','院级'];
 function fc(obj,kws){for(var i=0;i<kws.length;i++)for(var k in obj)if(k.indexOf(kws[i])>=0&&obj[k]!==undefined&&obj[k]!==null&&obj[k]!=='')return k;return'';}
 function rk(s){if(!s)return null;var m=String(s).match(/(\d+)\s*\/\s*(\d+)/);return m?{r:parseInt(m[1]),t:parseInt(m[2]),p:parseInt(m[1])/parseInt(m[2])}:null;}
 function sr(r){if(!r)return 0;if(r.p<=.05)return R.rank.top5;if(r.p<=.10)return R.rank.top10;if(r.p<=.20)return R.rank.top20;return 0;}
-function dlv(t){if(/国家|全国|中国|教育部|团中央|国际|全球|国赛|国奖|国家级/.test(t))return{n:'国家级',k:'ln'};if(/省|自治区|省级|省部|省赛/.test(t))return{n:'省级',k:'lp'};if(/市|市级|市赛/.test(t)&&!/省市|直辖市/.test(t))return{n:'市级',k:'lm'};if(/校|校级|校赛/.test(t))return{n:'校级/协会级',k:'ls'};if(/院|院级|院赛/.test(t))return{n:'院级',k:'ly'};return{n:'校/院级',k:'ls'};}
+function dlv(t){
+  t=String(t||'').normalize('NFKC');
+  // Award stages take precedence over a nationwide competition title.
+  if(/院级|院赛|院内选拔|学院选拔/.test(t))return{n:'院级',k:'ly',known:true};
+  if(/校级|校赛|校内选拔|校内赛|学校选拔/.test(t))return{n:'校级/协会级',k:'ls',known:true};
+  if(/省级|省赛|省决赛|省内选拔|省一等奖|省二等奖|省三等奖|(?:广东|浙江|江苏|福建|山东|湖南|湖北|四川|河南|河北|安徽|江西|云南|贵州|海南|山西|陕西|甘肃|青海|吉林|辽宁|黑龙江)省/.test(t))return{n:'省级',k:'lp',known:true};
+  if(/市级|市赛|市决赛|市内选拔/.test(t))return{n:'市级',k:'lm',known:true};
+  if(/国家级|国赛|国奖|全国(?:总)?决赛|全国赛|国际(?:总)?决赛/.test(t))return{n:'国家级',k:'ln',known:true};
+  return{n:'级别待确认',k:'ls',known:false};
+}
+
 function getLvScore(cn,ln){var c=R.levelAward[cn];if(!c)return 0;var i=c.lv.indexOf(ln);return i>=0?c.sc[i]:c.sc[c.sc.length-1]||0;}
 function sp(t){
-  if(!t||t=="无"||t=="-")return[];
-  var s=String(t);
-  // Split by newlines (handle both CRLF and LF)
-  var lines=s.replace(/\r/g,"").split("\n").filter(Boolean);
-  var raw=[];
-  for(var i=0;i<lines.length;i++){
-    var line=lines[i].trim();
-    if(!line)continue;
-    // Check for numbered items: 1.xxx 2.xxx 3.xxx
-    var nf=line.match(/\d+[.、)）]/g);
-    if(nf&&nf.length>=1){
-      var parts=line.replace(/(\d+[.、)）])/g,"\x00$1").split("\x00").filter(Boolean);
-      for(var k=0;k<parts.length;k++)raw.push(parts[k]);
-    }else{raw.push(line);}
-  }
-  // Second pass: split by 、 for short items
-  var expanded=[];
-  for(var i=0;i<raw.length;i++){
-    var item=raw[i];
-    if(/^\s*\d+[.、)）]/.test(item)){expanded.push(item);}
-    else if(item.indexOf("、")>=0){
-      var segs=item.split(/、/);
-      var allShort=segs.every(function(s2){return s2.length<=30;});
-      if(allShort&&segs.length>1){
-        for(var k=0;k<segs.length;k++){var seg=segs[k].trim();if(seg)expanded.push(seg);}
-      }else{expanded.push(item);}
-    }else{expanded.push(item);}
-  }
-  // Clean and collect
-  var o=[];
-  for(var i=0;i<expanded.length;i++){
-    var c2=expanded[i];
-    c2=c2.replace(/^\s*\d+\s*[.、)）]\s*/,"");
-    c2=c2.replace(/^\s*[-*•]\s*/,"");
-    c2=c2.trim();
-    if(c2&&c2.length>1&&c2!="无")o.push(c2);
-  }
-  if(o.length===0&&s.trim())o.push(s.trim());
-  return o;
+  if(t==null)return[];
+  var text=String(t).replace(/\r\n?/g,'\n').replace(/[；;]/g,'\n');
+  // Numbered lists must start at a boundary; preserve decimals and dates.
+  text=text.replace(/(^|[\n\s])(?:[1-9]\d?[、)）]|[1-9]\d?\.(?!\d))/g,'\n');
+  var out=[];
+  text.split('\n').forEach(function(line){
+    line=line.replace(/^\s*[-*•]\s*/,'').trim();
+    if(!line||/^(无|暂无|没有|无获奖|无获奖情况|-|—)$/.test(line))return;
+    // Split a Chinese list only when each segment independently names an award.
+    var parts=line.split('、');
+    if(parts.length>1&&parts.every(function(x){return /奖|荣誉|称号/.test(x);})){
+      parts.forEach(function(x){if(x.trim())out.push(x.trim());});
+    }else out.push(line);
+  });
+  return out;
 }
+function _isTemplateExample(row){return (row['姓名']||row['名字']||'')==='张三（填写示例，请删除或替换）';}
+function _awardIdentity(raw){return String(raw||'').normalize('NFKC').replace(/\s+/g,'').replace(/[，,。;；]/g,'');}
+function _dedupeExactAwards(arr){
+  var seen={};
+  for(var i=arr.length-1;i>=0;i--){var key=_awardIdentity(arr[i].raw);if(seen[key])arr.splice(i,1);else seen[key]=true;}
+}
+function _captureManualItems(m){
+  if(!m._cl)return;
+  m._manualItems=[];
+  ['ac','pt','dc'].forEach(function(cat){(m._cl[cat]||[]).forEach(function(items,si){items.forEach(function(item){
+    if(item.auto===false)m._manualItems.push({cat:cat,si:si,item:JSON.parse(JSON.stringify(item))});
+  });});});
+}
+function _restoreManualItems(m){
+  (m._manualItems||[]).forEach(function(saved){
+    ['ac','pt','dc'].forEach(function(cat){m._cl[cat].forEach(function(items){for(var i=items.length-1;i>=0;i--){if(_awardIdentity(items[i].raw)===_awardIdentity(saved.item.raw))items.splice(i,1);}});});
+    m._unc=m._unc.filter(function(u){return _awardIdentity(u.raw)!==_awardIdentity(saved.item.raw);});
+    if(m._cl[saved.cat]&&m._cl[saved.cat][saved.si])m._cl[saved.cat][saved.si].push(JSON.parse(JSON.stringify(saved.item)));
+  });
+}
+
 function parseVolHours(s){if(!s)return 0;s=String(s).replace(/小?时/g,'小时').replace(/分[钟]?/g,'分钟');var h=0,m=0,hm=s.match(/(\d+)\s*小时/),mm=s.match(/(\d+)\s*分/);if(hm)h=parseInt(hm[1]);if(mm)m=parseInt(mm[1]);if(!hm&&!mm){var n=parseFloat(s);if(!isNaN(n))h=n;}return Math.round((h+m/60)*100)/100;}
 function fmt(n){return Math.abs(n-Math.round(n))<0.05?Math.round(n):n.toFixed(1);}
 function ca(t){t=t.trim();if(!t)return null;var lm=APP.learnedMap&&APP.learnedMap[t];if(lm)return JSON.parse(JSON.stringify(lm));var vm=(R.levelAward['志愿服务']&&R.levelAward['志愿服务'].mode)||'level';if(/志愿/.test(t)&&!/奖|星|优秀|先进|表彰/.test(t)&&!/大赛|竞赛/.test(t)){if(vm=='per'){var vp=R.levelAward['志愿服务'].perVal||2;return{c:'party',i:1,n:'志愿服务',p:vp,cf:.9};}return{c:'party',i:1,n:'志愿服务活动',p:0,cf:1,sk:1};}var r=[],v1=R.perActivity['党课学习']||5,v2=R.perActivity['红心活动']||3,v3=R.perActivity['社会实践']||5,v4=R.perActivity['国际交流']||2,v5=R.perActivity['同辈互助']||2;if(/党课|党校|入党积极分子培训|发展对象培训|青马工程|党员培训|团校/.test(t))r.push({c:'party',i:0,n:'党课学习',p:v1,cf:.95});if(/(?:纪念馆|博物馆|红色基地|革命旧址|党史馆|烈士陵园|红色景点)/.test(t)&&/党课|党校|培训/.test(t))r.push({c:'party',i:0,n:'党课学习',p:v1,cf:.9});if(/升旗|植树|养老院|敬老院|祭扫|扫墓|缅怀先烈/.test(t))r.push({c:'party',i:2,n:'红心活动',p:v2,cf:.9});if(/红色|纪念馆|博物馆|革命|党史|烈士|缅怀|红色基因|爱国|长征|研学|红色基地|革命旧址|党史馆|烈士陵园/.test(t)&&!/党课|党校|培训/.test(t))r.push({c:'party',i:2,n:'红心活动',p:v2,cf:.85});if(/社会实践|三下乡|调研|千股工程|双百行动|乡村振兴|直联|支教|寒暑假实践|百千万|电商助农|直播助农|调研报告|走访调研|红色实践/.test(t))r.push({c:'party',i:3,n:'社会实践',p:v3,cf:.85,sp:1});if(/(?:中外交流|留学生|外籍|海外|foreign|exchange|国际文化|跨境)/.test(t))r.push({c:'party',i:4,n:'国际交流',p:v4,cf:.85});else if(/国际交流/.test(t)&&!/国际交流学院|学院/.test(t))r.push({c:'party',i:4,n:'国际交流',p:v4,cf:.80});if(/思政|形势政策|主题团日|主题班会|思想汇报|青年大学习|团课|团日/.test(t))r.push({c:'party',i:2,n:'红心活动',p:v2,cf:.82});if(/党日|支部|党建|党员大会|组织生活|民主评议|主题党日/.test(t)&&!/培训|党课|党校/.test(t))r.push({c:'party',i:2,n:'红心活动',p:v2,cf:.8});if(/迎新|运动会|开幕式|[Mm][Vv]|献血|巡逻|军训|晚会|讲座|观众|乒乓|毕业|典礼|体检|[Cc][Pp][Rr]|职业规划|高招|咨询|食堂|查寝|值班|协助|布置|排练|扫除|劳动|啦啦|方阵|拔河|趣味|篮球|足球|排球|羽毛球|网球|合唱|朗诵|主持|礼仪|接待|引导|维持|后勤|布场|撤场|机动|工作人员|带队|宣传|招新|纳新|社团|文艺|演出|歌唱|舞蹈|乐器|辩论|演讲|体育|学院.*活动|活动.*学院|院内|巡查|助班|新生|大会|研讨|表演|演唱|录制|拍摄|制作|海报|艺术节|文化节|读书会|欢送会|音乐会|辅导员|医疗|采访|访谈|座谈|沙龙|论坛|分享会|报告会|团建|素拓|观摩|走访|参观|集训|拓展|例会|培训|竞赛|比赛|视频|宣传片|纪录片|新闻|编辑|撰写|写稿|总结|汇报|答辩|面试|评选|考核|检查|督导|执勤|守卫|安保|广播|摄影|摄像|设计|绘画|书法|征文|策划|组织.*活动|班级活动|社团活动|文体活动|学生活动|团日活动|实践/.test(t))r.push({c:'party',i:5,n:'同辈互助',p:v5,cf:.75});if(r.length===0&&/活动|参加|参与|组织/.test(t))r.push({c:'party',i:5,n:'同辈互助',p:v5,cf:.45});if(r.length===0)return{c:'?',i:-1,n:'不确定',p:0,cf:0,raw:t};r.sort(function(a,b){return b.cf-a.cf;});var b=r[0];b.raw=t;if(!APP.learnedMap)APP.learnedMap={};return b;}
-function caw(t){t=t.trim();if(!t)return null;var lm=APP.learnedMap&&APP.learnedMap[t];if(lm)return JSON.parse(JSON.stringify(lm));var l=dlv(t),r=[];if(/论文|专利|期刊|SCI|EI|核心|发表|软著|软件著作权|实用新型|外观设计/.test(t)&&!/奖学金/.test(t)){var cP=R.levelAward['学科竞赛'],ptsP,lvP;if(/SCI|EI|核心|发明专利/.test(t)){ptsP=cP.sc[0];lvP=cP.lv[0];}else if(/实用新型|普通期刊|会议论文/.test(t)){ptsP=cP.sc[1];lvP=cP.lv[1];}else{ptsP=cP.sc[3];lvP=cP.lv[3];}r.push({c:'ac',i:3,n:'学科竞赛',pts:ptsP,l:{n:lvP,k:'ln'},cf:.92});}if(/奖学金/.test(t)){var c2=R.levelAward['奖学金'],pts=c2.sc[c2.sc.length-1],lvN=c2.lv[c2.lv.length-1];if(/国家奖学金/.test(t)&&!/励志/.test(t)){lvN=c2.lv[0];pts=c2.sc[0];}else if(/国家励志|励志奖学金/.test(t)){lvN=c2.lv[1];pts=c2.sc[1];}else if(/一等/.test(t)){lvN=c2.lv[2];pts=c2.sc[2];}else if(/二等/.test(t)){lvN=c2.lv[3];pts=c2.sc[3];}else if(/三等/.test(t)){lvN=c2.lv[4];pts=c2.sc[4];}r.push({c:'ac',i:5,n:'奖学金/荣誉',pts:pts,l:{n:lvN,k:'ln'},cf:.98});}if(/优秀|先进|标兵|十佳|三好|模范|榜样|先锋|杰出|突出|精神文明|之星|星级|最美|先进个人|文明|积极分子|优秀团干|优秀干事|优秀部长|优秀工作者|先进工作者|先进班集体|文明宿舍|荣誉/.test(t)&&!/奖学金|竞赛|大赛/.test(t)){var c3=R.levelAward['荣誉称号'],pts2=c3.sc[0],lv2=c3.lv[0];if(/优秀学员|优秀营员|结业/.test(t)){pts2=c3.sc[1];lv2=c3.lv[1];}if(/志愿|服务之星|志愿者/.test(t)){pts2=c3.sc[2];lv2=c3.lv[2];}if(/标兵|十佳|模范|榜样|杰出|突出/.test(t)){pts2=c3.sc[3];lv2=c3.lv[3];}r.push({c:'ac',i:5,n:'奖学金/荣誉',pts:pts2,l:{n:lv2,k:'lp'},cf:.95});}// Sports awards -> 奖学金/荣誉
+function caw(t){
+  var known=APP.learnedMap&&APP.learnedMap[t.trim()];
+  if(known)return JSON.parse(JSON.stringify(known));
+  var result=_classifyAwardLegacy(t);if(!result)return result;
+  var level=dlv(t);
+  if(/奖学金/.test(t)&&!/国家奖学金|国家励志|励志奖学金|一等|二等|三等/.test(t)){result.cf=0.4;result.pts=0;result.p=0;result.reviewReason='奖学金名称或等次不完整，请确认后计分。';return result;}
+  var needsLevel=(result.c==='ac'&&(result.i===3||result.i===4))||(result.c==='party'&&result.i===3)||/体育|足球|篮球|排球|羽毛球|乒乓|游泳|田径|长跑|跳远/.test(t);
+  if(needsLevel&&!level.known&&!/论文|专利|SCI|EI|软著|软件著作权/.test(t)){
+    result.cf=Math.min(result.cf||0,0.4);result.pts=0;result.p=0;
+    result.reviewReason='材料未明确获奖阶段，不能仅凭赛事名称确定级别。';
+    result.l=level;
+  }
+  return result;
+}
+function _classifyAwardLegacy(t){t=t.trim();if(!t)return null;var lm=APP.learnedMap&&APP.learnedMap[t];if(lm)return JSON.parse(JSON.stringify(lm));var l=dlv(t),r=[];if(/论文|专利|期刊|SCI|EI|核心|发表|软著|软件著作权|实用新型|外观设计/.test(t)&&!/奖学金/.test(t)){var cP=R.levelAward['学科竞赛'],ptsP,lvP;if(/SCI|EI|核心|发明专利/.test(t)){ptsP=cP.sc[0];lvP=cP.lv[0];}else if(/实用新型|普通期刊|会议论文/.test(t)){ptsP=cP.sc[1];lvP=cP.lv[1];}else{ptsP=cP.sc[3];lvP=cP.lv[3];}r.push({c:'ac',i:3,n:'学科竞赛',pts:ptsP,l:{n:lvP,k:'ln'},cf:.92});}if(/奖学金/.test(t)){var c2=R.levelAward['奖学金'],pts=c2.sc[c2.sc.length-1],lvN=c2.lv[c2.lv.length-1];if(/国家奖学金/.test(t)&&!/励志/.test(t)){lvN=c2.lv[0];pts=c2.sc[0];}else if(/国家励志|励志奖学金/.test(t)){lvN=c2.lv[1];pts=c2.sc[1];}else if(/一等/.test(t)){lvN=c2.lv[2];pts=c2.sc[2];}else if(/二等/.test(t)){lvN=c2.lv[3];pts=c2.sc[3];}else if(/三等/.test(t)){lvN=c2.lv[4];pts=c2.sc[4];}r.push({c:'ac',i:5,n:'奖学金/荣誉',pts:pts,l:{n:lvN,k:'ln'},cf:.98});}if(/优秀|先进|标兵|十佳|三好|模范|榜样|先锋|杰出|突出|精神文明|之星|星级|最美|先进个人|文明|积极分子|优秀团干|优秀干事|优秀部长|优秀工作者|先进工作者|先进班集体|文明宿舍|荣誉/.test(t)&&!/奖学金|竞赛|大赛|优秀奖|优秀作品奖/.test(t)){var c3=R.levelAward['荣誉称号'],pts2=c3.sc[0],lv2=c3.lv[0];if(/优秀学员|优秀营员|结业/.test(t)){pts2=c3.sc[1];lv2=c3.lv[1];}if(/志愿|服务之星|志愿者/.test(t)){pts2=c3.sc[2];lv2=c3.lv[2];}if(/标兵|十佳|模范|榜样|杰出|突出/.test(t)){pts2=c3.sc[3];lv2=c3.lv[3];}r.push({c:'ac',i:5,n:'奖学金/荣誉',pts:pts2,l:{n:lv2,k:'lp'},cf:.95});}// Sports awards -> 奖学金/荣誉
   if(/体育|篮球|足球|排球|羽毛球|网球|乒乓|游泳|田径|武术|体操|跳绳|毽子|拔河|马拉松|越野|定向|健美操|啦啦操|舞龙|舞狮|龙舟|赛艇|击剑|射击|射箭|举重|摔跤|柔道|跆拳道|拳击|滑冰|滑雪|冰球/.test(t)&&/奖|赛|冠军|亚军|季军|金牌|银牌|铜牌|名次|第一|第二|第三|优胜|锦标赛|杯赛|联赛/.test(t)&&!/志愿/.test(t)){
     var cS=R.levelAward['体育竞赛'];var ptsS=cS?getLvScore('体育竞赛',l.n):(l.n=='国家级'?7:l.n=='省级'?5:l.n=='市级'?3:l.n=='校级/协会级'?2:1);
     r.push({c:'ac',i:5,n:'奖学金/荣誉',pts:ptsS,l:l,cf:.88});}
   if(/竞赛|大赛|挑战杯|建模|蓝桥杯|ACM|数学竞赛|英语竞赛|编程|电子设计|机器人|物理|化学|生物|计算机|外语|翻译|演讲|辩论|知识竞赛|技能赛|三创赛|职业规划大赛/.test(t)&&!/创新|创业|商业|孵化/.test(t)&&!/奖学金/.test(t)&&!/志愿/.test(t)&&!/论文|专利/.test(t)){var c4=R.levelAward['学科竞赛'],pts3=getLvScore('学科竞赛',l.n);r.push({c:'ac',i:3,n:'学科竞赛',pts:pts3||c4.sc[c4.sc.length-1],l:l,cf:.9});}if(/创新|创业|大创|孵化|商业计划|互联网\+|创青春|挑战杯.*创业|立项/.test(t)&&!/奖学金/.test(t)){var c5=R.levelAward['创新创业'],pts4=getLvScore('创新创业',l.n);r.push({c:'ac',i:4,n:'创新创业',pts:pts4||c5.sc[c5.sc.length-1],l:l,cf:.88});}if(/社会实践|三下乡|千股工程|双百行动|红色实践|调研报告|直联|电商助农|直播助农/.test(t)&&!/奖学金|优秀团员/.test(t)){var c6=R.levelAward['社会实践成果'],pts5=getLvScore('社会实践成果',l.n);r.push({c:'party',i:3,n:'社会实践',pts:pts5||c6.sc[c6.sc.length-1],l:l,cf:.85});}if(/志愿/.test(t)&&/奖|星|优秀|先进|表彰|证书|之星/.test(t)&&!/奖学金|竞赛|大赛/.test(t)){r.push({c:'ac',i:5,n:'奖学金/荣誉',pts:2,l:{n:'志愿者之星/优秀志愿者',k:'ls'},cf:.88});}if(/认证|华为|HarmonyOS|高级工程师|高级开发师/.test(t)&&!/奖学金|志愿/.test(t)){var c7=R.levelAward['创新创业'];r.push({c:'ac',i:4,n:'创新创业',pts:c7.sc[c7.sc.length-1],l:l,cf:.72});}if(/证书/.test(t)&&!/荣誉|奖|优秀|志愿服务|志愿|认证|华为|HarmonyOS/.test(t)){var c7b=R.levelAward['创新创业'];r.push({c:'ac',i:4,n:'创新创业',pts:c7b.sc[c7b.sc.length-1],l:l,cf:.55});}if(r.length===0&&/奖|赛|杯/.test(t)){var c9=R.levelAward['学科竞赛'],pts7=getLvScore('学科竞赛',l.n);r.push({c:'ac',i:3,n:'学科竞赛',pts:pts7||c9.sc[c9.sc.length-1],l:l,cf:.45});}if(r.length===0)return{c:'?',i:-1,n:'不确定',pts:0,cf:0,raw:t};r.sort(function(a,b){return b.cf-a.cf;});var b=r[0];b.raw=t;if(!APP.learnedMap)APP.learnedMap={};return b;}
 function ssw(ps){
-  if(!ps||ps=="无"||ps=="-")return{s:0,it:[]};
-  var p2=String(ps).split(/[,，、;；\/\s]+/).filter(Boolean),best=0,bestIt=null;
-  for(var i=0;i<p2.length;i++){
-    var p=p2[i],sc=0,lv="";
-    if(/校.*(?:主席|副主席|部长|副部长|主任|团委|学生会|社联)/.test(p)||/(?:主席|副主席).*校/.test(p)||/(?:部长|主任).*校/.test(p)){sc=R.socialWork["校级主席/部长"];lv="校级主席/部长";}
-    else if(/校.*(?:副部长|副主任)/.test(p)){sc=R.socialWork["校级副主席/副部长"];lv="校级副主席/副部长";}
-    else if(/院.*(?:主席|部长|主任|团委|学生会)/.test(p)||/(?:主席|部长).*院/.test(p)){sc=R.socialWork["院级主席/部长"];lv="院级主席/部长";}
-    else if(/班长|团支书/.test(p)){sc=R.socialWork["班长/团支书"];lv="班长/团支书";}
-    else if(/副班/.test(p)){sc=R.socialWork["副班长"];lv="副班长";}
-    else if(/学习委员|组织委员|宣传委员|生活委员|文体委员|心理委员|纪律委员|班委/.test(p)){sc=R.socialWork["其他班委/院级干事/校级干事"];lv="其他班委";}
-    else if(/干事|委员/.test(p)){sc=R.socialWork["其他班委/院级干事/校级干事"];lv="干事/委员";}
-    if(sc>best){best=sc;bestIt={r:p,s:sc,l:lv,lk:"ly"};}
-  }
-  if(best>0)return{s:best,it:[bestIt||{r:ps,s:best,l:"",lk:"ly"}]};
-  return{s:0,it:[]};
+  var best=0,bestIt=null,review=[];
+  if(!ps||/^(无|暂无|-)$/.test(String(ps).trim()))return{s:0,it:[],review:[]};
+  var entries=String(ps).split(/[,，、;；/\n]+/).map(function(x){return x.replace(/\s+/g,'');}).filter(Boolean);
+  entries.forEach(function(raw){
+    var school=/校级|学校|校团委|校学生会|校社联|校[^，；;]*?(?:部|会|团|队|社)/.test(raw);
+    var college=!school&&/学院|院级|院团委|院学生会|院[^，；;]*?部/.test(raw);
+    var deputy=/副主席|副部长|副主任|副负责人/.test(raw);
+    var leader=/主席|部长|主任|负责人/.test(raw);
+    var staff=/干事|委员/.test(raw);
+    var sc=0,level='',badge=school?'ls':college?'ly':'ls';
+    if(/副班长/.test(raw)){sc=R.socialWork['副班长'];level='副班长';}
+    else if(/班长|团支书|团支部书记/.test(raw)){sc=R.socialWork['班长/团支书'];level='班长/团支书';}
+    else if(/主席团成员/.test(raw)){review.push({raw:raw,reason:'主席团成员的计分档位需要管理员确认。'});}
+    else if(staff){sc=R.socialWork['其他班委/院级干事/校级干事'];level=school?'校级干事/委员':college?'院级干事/委员':'班委/干事';}
+    else if(deputy&&school){sc=R.socialWork['校级副主席/副部长'];level='校级副主席/副部长';}
+    else if(deputy&&college){review.push({raw:raw,reason:'现有规则没有单列院级副职，请管理员确认，不自动按正职计分。'});}
+    else if(leader&&school){sc=R.socialWork['校级主席/部长'];level='校级主席/部长';}
+    else if(leader&&college){sc=R.socialWork['院级主席/部长'];level='院级主席/部门负责人';}
+    else if(/班委/.test(raw)){sc=R.socialWork['其他班委/院级干事/校级干事'];level='其他班委';}
+    else{review.push({raw:raw,reason:'请写清校级或院级、组织部门和职务；当前信息不足以自动计分。'});}
+    if(!Number.isFinite(sc)&&level){review.push({raw:raw,reason:'该职务对应的积分档位尚未配置。'});return;}
+    if(sc>best){best=sc;bestIt={r:raw,s:sc,l:level,lk:badge};}
+  });
+  return{s:best,it:bestIt?[bestIt]:[],review:review};
 }
 
-function classifyMember(m){if(m._ok)return;m._ok=true;m._cl={ac:[[],[],[],[],[],[]],pt:[[],[],[],[],[],[]],dc:[[],[],[],[],[],[]]};m._unc=[];var done={};function add(k){if(done[k])return true;done[k]=true;return false;}var awards=sp(m['获奖情况']||'');(function(arr){var a2=[];for(var j=0;j<arr.length;j++){var t=arr[j],m=t.match(/^(.*?)(\d{4}[-~—至到]\d{4}\s*\S{0,3})\s*(及|和|与)\s*(\d{4}[-~—至到]\d{4}\s*\S{0,3})\s*(.*)$/);if(m){a2.push((m[1]+m[2]+m[5]).trim());a2.push((m[1]+m[4]+m[5]).trim());}else{a2.push(t);}}arr.length=0;for(var j=0;j<a2.length;j++)arr.push(a2[j]);})(awards);for(var i=0;i<awards.length;i++){var t=awards[i];if(add(t))continue;var cl=caw(t);if(!cl)continue;if(cl.c=='?'){m._unc.push({type:'award',raw:t,cl:cl});continue;}if(cl.cf<.55){m._unc.push({type:'award',raw:t,cl:cl});continue;}if(cl.c=='ac')m._cl.ac[cl.i].push({raw:t,score:cl.pts,level:cl.l?cl.l.n:'',lk:cl.l?cl.l.k:'ls',auto:true});else if(cl.c=='party')m._cl.pt[cl.i].push({raw:t,score:cl.pts||cl.p||0,level:cl.l?cl.l.n:'',lk:cl.l?cl.l.k:'ls',auto:true});}var acts=sp(m['参与学校、学院的活动（请罗列）']||'');for(var i=0;i<acts.length;i++){var t=acts[i];if(add(t))continue;var cl=ca(t);if(!cl)continue;if(cl.sk)continue;if(cl.c=='?'){m._unc.push({type:'activity',raw:t,cl:cl});continue;}if(cl.cf<.55){m._unc.push({type:'activity',raw:t,cl:cl});continue;}if(cl.c=='party')m._cl.pt[cl.i].push({raw:t,score:cl.p,level:'',lk:'ls',auto:true});}var pos=m['职位（班级/部门）']||'';if(pos&&pos!='无'&&pos!='-'&&!add('_pos_')){var sw=ssw(pos);m._cl.ac[2]=sw.it.map(function(x){return{raw:'职务: '+x.r,score:x.s,level:x.l,lk:x.lk,auto:true};});}if(!add('_rank_')){var rc=fc(m,['学习','成绩']);if(rc){var rr=rk(m[rc]);if(rr)m._cl.ac[0].push({raw:'排名 '+rr.r+'/'+rr.t+' (前'+(rr.p*100).toFixed(1)+'%)',score:sr(rr),auto:true});}var rc2=fc(m,['测评','综测']);if(rc2){var rr2=rk(m[rc2]);if(rr2)m._cl.ac[1].push({raw:'排名 '+rr2.r+'/'+rr2.t+' (前'+(rr2.p*100).toFixed(1)+'%)',score:sr(rr2),auto:true});}}if(!add('_volh_')){var vCat=R.levelAward['志愿服务'],vMode=vCat?((vCat.mode)||'level'):'level';if(vMode=='hourly'){var vRate=vCat.rate||0.25,vCap=vCat.cap||8;var vc=fc(m,['志愿','时']);if(vc){var hrs=parseVolHours(m[vc]);if(hrs>0){var rawScore=hrs*vRate;var capped=Math.min(rawScore,vCap);m._cl.pt[1].push({raw:'志愿时长 '+hrs+'h x'+vRate+'='+rawScore.toFixed(1)+(rawScore>vCap?'(上限'+vCap+')':''),score:capped,auto:true});}}}}if(!add('_dc_')){if(m['是否违纪']=='是')m._cl.dc[3].push({raw:'违纪记录',score:R.discipline.warning,auto:true});if(m['是否挂科']=='是')m._cl.dc[1].push({raw:'挂科(每门'+R.discipline.fail+'分)',score:R.discipline.fail,auto:true});}(function(arr){if(!arr||arr.length<2)return;var g={};for(var i=0;i<arr.length;i++){var key=arr[i].raw.replace(/国家|省|市|校|院|一等|二等|三等|优秀奖|金奖|银奖|铜奖|特等/g,'').replace(/\s+/g,'').substring(0,20);if(!g[key]||arr[i].score>g[key].score)g[key]=arr[i];}arr.length=0;for(var k in g)arr.push(g[k]);})(m._cl.ac[3]);(function(arr){if(!arr||arr.length<2)return;var g={};for(var i=0;i<arr.length;i++){var key=arr[i].raw.replace(/国家|省|市|校|院|一等|二等|三等|优秀奖|金奖|银奖|铜奖|特等/g,'').replace(/\s+/g,'').substring(0,20);if(!g[key]||arr[i].score>g[key].score)g[key]=arr[i];}arr.length=0;for(var k in g)arr.push(g[k]);})(m._cl.pt[3]);}
-function calc(m,coef){var cl=m._cl,ac=[0,0,0,0,0,0],pt=[0,0,0,0,0,0],dc=[0,0,0,0,0,0];for(var i=0;i<6;i++){ac[i]=cl.ac[i].reduce(function(s,d){return s+(d.score||0);},0);pt[i]=cl.pt[i].reduce(function(s,d){return s+(d.score||0);},0);dc[i]=cl.dc[i].reduce(function(s,d){return s+(d.score||0);},0);}var cf=coef?0.6:1,fin={ac:[],pt:[],dc:[],t:0,w:[],acT:0,ptT:0,dcT:0};if(dc[1]<0)fin.w.push('存在挂科记录（每门'+R.discipline.fail+'分）');if(dc[5]!==0){fin.w.push('一票否决！');fin.veto=true;return fin;}var at=0;for(var i=0;i<6;i++){var v=ac[i]*cf;fin.ac.push(v);at+=v;}if(at>R.acCap){fin.w.push('学业('+at.toFixed(1)+')超上限截断');at=R.acCap;}fin.acT=at;var ptt=0;for(var i=0;i<6;i++){var v=pt[i]*cf;fin.pt.push(v);ptt+=v;}if(ptt>R.ptCap){fin.w.push('党性('+ptt.toFixed(1)+')超上限截断');ptt=R.ptCap;}fin.ptT=ptt;var dt=0;for(var i=0;i<6;i++){var v=dc[i];fin.dc.push(v);dt+=v;}fin.dcT=dt;fin.t=Math.max(0,at+ptt+dt);if(fin.t>100){fin.w.push('总分('+fmt(fin.t)+')超上限截断至100');fin.t=100;}return fin;}
+function classifyMember(m){if(m._ok&&m._recognitionVersion===12)return;_captureManualItems(m);m._recognitionVersion=12;m._ok=true;m._cl={ac:[[],[],[],[],[],[]],pt:[[],[],[],[],[],[]],dc:[[],[],[],[],[],[]]};m._unc=[];var done={};function add(k){if(done[k])return true;done[k]=true;return false;}var awards=sp(m['获奖情况']||'');(function(arr){var a2=[];for(var j=0;j<arr.length;j++){var t=arr[j],m=t.match(/^(.*?)(\d{4}[-~—至到]\d{4}\s*\S{0,3})\s*(及|和|与)\s*(\d{4}[-~—至到]\d{4}\s*\S{0,3})\s*(.*)$/);if(m){a2.push((m[1]+m[2]+m[5]).trim());a2.push((m[1]+m[4]+m[5]).trim());}else{a2.push(t);}}arr.length=0;for(var j=0;j<a2.length;j++)arr.push(a2[j]);})(awards);for(var i=0;i<awards.length;i++){var t=awards[i];if(add(t))continue;var cl=caw(t);if(!cl)continue;if(cl.c=='?'){m._unc.push({type:'award',raw:t,cl:cl});continue;}if(cl.cf<.55){m._unc.push({type:'award',raw:t,cl:cl});continue;}if(cl.c=='ac')m._cl.ac[cl.i].push({raw:t,score:cl.pts,level:cl.l?cl.l.n:'',lk:cl.l?cl.l.k:'ls',auto:true});else if(cl.c=='party')m._cl.pt[cl.i].push({raw:t,score:cl.pts||cl.p||0,level:cl.l?cl.l.n:'',lk:cl.l?cl.l.k:'ls',auto:true});}var acts=sp(m['参与学校、学院的活动（请罗列）']||'');for(var i=0;i<acts.length;i++){var t=acts[i];if(add(t))continue;var cl=ca(t);if(!cl)continue;if(cl.sk)continue;if(cl.c=='?'){m._unc.push({type:'activity',raw:t,cl:cl});continue;}if(cl.cf<.55){m._unc.push({type:'activity',raw:t,cl:cl});continue;}if(cl.c=='party')m._cl.pt[cl.i].push({raw:t,score:cl.p,level:'',lk:'ls',auto:true});}var pos=m['职位（班级/部门）']||'';if(pos&&pos!='无'&&pos!='-'&&!add('_pos_')){var sw=ssw(pos);m._cl.ac[2]=sw.it.map(function(x){return{raw:'职务: '+x.r,score:x.s,level:x.l,lk:x.lk,auto:true};});(sw.review||[]).forEach(function(u){m._unc.push({type:'position',raw:'职务: '+u.raw,cl:{c:'ac',i:2,n:'社会工作',cf:0.4,pts:0,reviewReason:u.reason}});});}if(!add('_rank_')){var rc=fc(m,['学习','成绩']);if(rc){var rr=rk(m[rc]);if(rr)m._cl.ac[0].push({raw:'排名 '+rr.r+'/'+rr.t+' (前'+(rr.p*100).toFixed(1)+'%)',score:sr(rr),auto:true});}var rc2=fc(m,['测评','综测']);if(rc2){var rr2=rk(m[rc2]);if(rr2)m._cl.ac[1].push({raw:'排名 '+rr2.r+'/'+rr2.t+' (前'+(rr2.p*100).toFixed(1)+'%)',score:sr(rr2),auto:true});}}if(!add('_volh_')){var vCat=R.levelAward['志愿服务'],vMode=vCat?((vCat.mode)||'level'):'level';if(vMode=='hourly'){var vRate=vCat.rate||0.25,vCap=vCat.cap||8;var vc=fc(m,['志愿','时']);if(vc){var hrs=parseVolHours(m[vc]);if(hrs>0){var rawScore=hrs*vRate;var capped=Math.min(rawScore,vCap);m._cl.pt[1].push({raw:'志愿时长 '+hrs+'h x'+vRate+'='+rawScore.toFixed(1)+(rawScore>vCap?'(上限'+vCap+')':''),score:capped,auto:true});}}}}if(!add('_dc_')){if(m['是否违纪']=='是')m._cl.dc[3].push({raw:'违纪记录',score:R.discipline.warning,auto:true});if(m['是否挂科']=='是')m._cl.dc[1].push({raw:'挂科(每门'+R.discipline.fail+'分)',score:R.discipline.fail,auto:true});}_dedupeExactAwards(m._cl.ac[3]);_dedupeExactAwards(m._cl.pt[3]);_restoreManualItems(m);}
+function calc(m,coef){var cl=m._cl,ac=[0,0,0,0,0,0],pt=[0,0,0,0,0,0],dc=[0,0,0,0,0];for(var i=0;i<6;i++){ac[i]=cl.ac[i].reduce(function(s,d){return s+(d.score||0);},0);pt[i]=cl.pt[i].reduce(function(s,d){return s+(d.score||0);},0);if(i<5)dc[i]=cl.dc[i].reduce(function(s,d){return s+(d.score||0);},0);}var cf=coef?0.6:1,fin={ac:[],pt:[],dc:[],t:0,w:[],acT:0,ptT:0,dcT:0};if(dc[1]<0)fin.w.push('存在挂科记录（每门'+R.discipline.fail+'分）');var at=0;for(var i=0;i<6;i++){var v=ac[i]*cf;fin.ac.push(v);at+=v;}if(at>R.acCap){fin.w.push('学业('+at.toFixed(1)+')超上限截断');at=R.acCap;}fin.acT=at;var ptt=0;for(var i=0;i<6;i++){var v=pt[i]*cf;fin.pt.push(v);ptt+=v;}if(ptt>R.ptCap){fin.w.push('党性('+ptt.toFixed(1)+')超上限截断');ptt=R.ptCap;}fin.ptT=ptt;var dt=0;for(var i=0;i<5;i++){var v=dc[i];fin.dc.push(v);dt+=v;}fin.dcT=dt;fin.t=Math.max(0,at+ptt+dt);if(fin.t>100){fin.w.push('总分('+fmt(fin.t)+')超上限截断至100');fin.t=100;}return fin;}
 function onBatchCatChange(){var sel=document.getElementById('batchCat');if(!sel||!sel.value)return;var parts=sel.value.split('-'),board=parts[0],si=parseInt(parts[1]);var subName=board=='ac'?AC[si]:(board=='dc'?DS[si]:PS[si]);var lc=getLevelCat(board,si,'');var lvSel=document.getElementById('batchLevel'),scInp=document.getElementById('batchScore');if(lc&&R.levelAward[lc]){lvSel.style.display='';scInp.style.display='none';lvSel.innerHTML='';var lcat=R.levelAward[lc];for(var j=0;j<lcat.lv.length;j++)lvSel.innerHTML+='<option value="'+j+'">'+lcat.lv[j]+' - '+lcat.sc[j]+'分</option>';}else{lvSel.style.display='none';scInp.style.display='';if(board=='pt'&&(si==0||si==2||si==4||si==5))scInp.value=R.perActivity[subName]||2;else scInp.value=0;}}
 function onGBatchCatChange(){var sel=document.getElementById('gbatchCat');if(!sel||!sel.value)return;var parts=sel.value.split('-'),board=parts[0],si=parseInt(parts[1]);var subName=board=='ac'?AC[si]:(board=='dc'?DS[si]:PS[si]);var lc=getLevelCat(board,si,'');var lvSel=document.getElementById('gbatchLevel'),scInp=document.getElementById('gbatchScore');if(lc&&R.levelAward[lc]&&R.levelAward[lc].lv){lvSel.style.display='';scInp.style.display='none';lvSel.innerHTML='';var lcat=R.levelAward[lc];for(var j=0;j<lcat.lv.length;j++)lvSel.innerHTML+='<option value="'+j+'">'+lcat.lv[j]+' - '+lcat.sc[j]+'分</option>';}else{lvSel.style.display='none';scInp.style.display='';if(board=='pt'&&(si==0||si==2||si==4||si==5))scInp.value=R.perActivity[subName]||2;else scInp.value=0;}}
 function batchFixHandler(){
@@ -374,7 +543,7 @@ function render(){
   document.getElementById('lblAcCap').textContent=R.acCap;document.getElementById('lblPtCap').textContent=R.ptCap;
   var wb=document.getElementById('warnBox');if(fin.w&&fin.w.length>0){wb.innerHTML=fin.w.join('<br>');wb.classList.add('on');}else{wb.classList.remove('on');wb.innerHTML='';}
   var all18=fin.ac.concat(fin.pt).concat(fin.dc);
-  var ht='<thead><tr><th class="ch" colspan="3">基本信息</th><th class="ch" colspan="6" style="background:#3B6FB6">学业能力</th><th class="ch" colspan="6" style="background:#8B1A1A">党性成长</th><th class="ch" colspan="6" style="background:#C07830">纪律约束</th><th class="ch">合计</th></tr>';
+  var ht='<thead><tr><th class="ch" colspan="3">基本信息</th><th class="ch" colspan="6" style="background:#3B6FB6">学业能力</th><th class="ch" colspan="6" style="background:#8B1A1A">党性成长</th><th class="ch" colspan="5" style="background:#C07830">纪律约束</th><th class="ch">合计</th></tr>';
   ht+='<tr><th class="sh col-sticky col-sticky-1">序号</th><th class="sh col-sticky col-sticky-2">班级</th><th class="sh col-sticky col-sticky-3">姓名</th>';for(var j=0;j<AC.length;j++)ht+='<th class="sh">'+AC[j]+'</th>';for(var j=0;j<PS.length;j++)ht+='<th class="sh">'+PS[j]+'</th>';for(var j=0;j<DS.length;j++)ht+='<th class="sh">'+DS[j]+'</th>';ht+='<th class="sh">合计</th></tr></thead><tbody><tr>';
   ht+='<td class="col-sticky col-sticky-1">'+(m['序号']||m['编号']||(i+1))+'</td><td class="col-sticky col-sticky-2">'+esc(m['班级']||'')+'</td><td class="col-sticky col-sticky-3">'+esc(m['姓名']||'')+'</td>';
   for(var j=0;j<all18.length;j++){var v=all18[j],cls='sc '+(v===0?'s0':v>0?'sp':'sn');ht+='<td class="'+cls+'" data-ci="'+j+'" style="cursor:pointer" title="点击编辑">'+fmt(v)+'</td>';}
@@ -383,7 +552,7 @@ function render(){
   var dg=document.getElementById('detailGrid'),cards='';var al=['学业成绩','综合测评','社会工作','学科竞赛','创新创业','奖学金/荣誉'];
   for(var j=0;j<6;j++){var rs=m._cl.ac[j].reduce(function(s,d){return s+(d.score||0);},0);cards+=buildCard('ac',j,al[j],m._cl.ac[j],rs);}
   for(var j=0;j<6;j++){var rs=m._cl.pt[j].reduce(function(s,d){return s+(d.score||0);},0);cards+=buildCard('pt',j,PS[j],m._cl.pt[j],rs);}
-  for(var j=0;j<6;j++){if(!m._cl.dc[j].length)continue;var rs=m._cl.dc[j].reduce(function(s,d){return s+(d.score||0);},0);cards+=buildCard('dc',j,DS[j],m._cl.dc[j],rs);}dg.innerHTML=cards;
+  for(var j=0;j<5;j++){if(!m._cl.dc[j].length)continue;var rs=m._cl.dc[j].reduce(function(s,d){return s+(d.score||0);},0);cards+=buildCard('dc',j,DS[j],m._cl.dc[j],rs);}dg.innerHTML=cards;
   var btns=dg.querySelectorAll('button[data-act]');for(var j=0;j<btns.length;j++){btns[j].onclick=(function(b){var act=b.getAttribute('data-act'),cat=b.getAttribute('data-cat'),si=parseInt(b.getAttribute('data-si')),idx2=parseInt(b.getAttribute('data-idx'));return function(){if(act=='edit')editItem(cat,si,idx2);else if(act=='move')moveItem(cat,si,idx2);else if(act=='del')delItem(cat,si,idx2);else if(act=='add')openAddModal(cat,si);};})(btns[j]);}
   var ul=document.getElementById('uncList');
   if(m._unc&&m._unc.length>0){
@@ -397,7 +566,7 @@ function render(){
     for(var gn in groups){
       body+='<div class="unc-group"><div class="unc-group-title">📁 可能属于 <b>'+gn+'</b>（'+groups[gn].length+'项）</div>';
       for(var gj=0;gj<groups[gn].length;gj++){var g=groups[gn][gj],u=g.u;
-        body+='<div class="unc-item"><input type="checkbox" class="unc-cb" data-uidx="'+g.idx+'">['+(u.type=='award'?'奖项':'活动')+'] <b>'+esc(u.raw.substring(0,80))+'</b> — '+(u.cl.cf?Math.round(u.cl.cf*100)+'%':'')+' <button class="btn btn-p btn-s" data-ufix="'+g.idx+'">归类</button> <button class="btn btn-g btn-s" data-udel="'+g.idx+'">忽略</button></div>';
+        body+='<div class="unc-item"><input type="checkbox" class="unc-cb" data-uidx="'+g.idx+'">['+(u.type=='award'?'奖项':u.type=='position'?'职务':'活动')+'] <b>'+esc(u.raw.substring(0,80))+'</b> '+(u.cl.reviewReason?'<span class="review-reason">'+esc(u.cl.reviewReason)+'</span>':'')+' — '+(u.cl.cf?Math.round(u.cl.cf*100)+'%':'')+' <button class="btn btn-p btn-s" data-ufix="'+g.idx+'">归类</button> <button class="btn btn-g btn-s" data-udel="'+g.idx+'">忽略</button></div>';
       }
       body+='</div>';
     }
@@ -462,7 +631,7 @@ function scrollToSummaryRow(mi){
 function getArr(cat,si){var m=APP.members[APP.curIdx];if(!m||!m._cl)return null;return cat=='ac'?m._cl.ac[si]:cat=='pt'?m._cl.pt[si]:m._cl.dc[si];}
 function getLevelCat(cat,si,rawText){if(cat=='ac'&&si==3)return'学科竞赛';if(cat=='ac'&&si==4)return'创新创业';if(cat=='ac'&&si==5){return'__MERGED__';}if(cat=='pt'&&si==1)return'志愿服务';if(cat=='pt'&&si==3)return'社会实践成果';return null;}
 function editItem(cat,si,idx2){var arr=getArr(cat,si);if(!arr||!arr[idx2])return;var d=arr[idx2];openItemModal('编辑条目',d,function(raw,score,lvl,lk){d.raw=raw;d.score=score;d.level=lvl;d.lk=lk;d.auto=false;closeModal();render();if(!document.getElementById("viewSummary").classList.contains("hide"))renderSummaryTable();},cat,si);}
-function delItem(cat,si,idx2){if(!confirm('确定删除？'))return;var arr=getArr(cat,si);if(!arr)return;arr.splice(idx2,1);render();}function moveItem(cat,si,idx2){var arr=getArr(cat,si);if(!arr||!arr[idx2])return;var d=arr[idx2];var allSubs=AC.concat(PS).concat(DS);var curName=allSubs[cat=='ac'?si:(cat=='pt'?si+6:si+12)];var curBoard=cat=='ac'?'学业':(cat=='pt'?'党性':'纪律');var m2='<h3>移动条目</h3><div style="font-size:13px;color:var(--mut);margin-bottom:8px">当前: '+curBoard+'-'+curName+'</div>';m2+='<div class="fg"><label>移动到</label><select id="mvCat">';for(var i=0;i<AC.length;i++)m2+='<option value="ac-'+i+'">学业-'+AC[i]+'</option>';for(var i=0;i<PS.length;i++)m2+='<option value="pt-'+i+'">党性-'+PS[i]+'</option>';for(var i=0;i<DS.length;i++)m2+='<option value="dc-'+i+'">纪律-'+DS[i]+'</option>';m2+='</select></div><div class="modal-acts"><button class="btn" onclick="closeModal()">取消</button><button class="btn btn-p" id="btnMoveConfirm">确定移动</button></div>';document.getElementById('modalBox').innerHTML=m2;document.getElementById('btnMoveConfirm').onclick=function(){var parts=document.getElementById('mvCat').value.split('-');var newCat=parts[0],newSi=parseInt(parts[1]);if(newCat==cat&&newSi==si){closeModal();return;}var tgt=getArr(newCat,newSi);if(!tgt){closeModal();return;}arr.splice(idx2,1);tgt.push(d);if(!APP.learnedMap)APP.learnedMap={};var le={raw:d.raw,cf:1};if(newCat=='ac'){le.c='ac';le.i=newSi;le.n=AC[newSi];le.pts=d.score;le.l={n:d.level||'',k:d.lk||'ls'};}else if(newCat=='pt'){le.c='party';le.i=newSi;le.n=PS[newSi];le.p=d.score;}else{le.c='dc';le.i=newSi;le.n=DS[newSi];le.p=d.score;}APP.learnedMap[d.raw]=le;closeModal();render();if(!document.getElementById("viewSummary").classList.contains("hide"))renderSummaryTable();};document.getElementById('modalBg').style.display='flex';}
+function delItem(cat,si,idx2){if(!confirm('确定删除？'))return;var arr=getArr(cat,si);if(!arr)return;arr.splice(idx2,1);render();}function moveItem(cat,si,idx2){var arr=getArr(cat,si);if(!arr||!arr[idx2])return;var d=arr[idx2];var allSubs=AC.concat(PS).concat(DS);var curName=allSubs[cat=='ac'?si:(cat=='pt'?si+6:si+12)];var curBoard=cat=='ac'?'学业':(cat=='pt'?'党性':'纪律');var m2='<h3>移动条目</h3><div style="font-size:13px;color:var(--mut);margin-bottom:8px">当前: '+curBoard+'-'+curName+'</div>';m2+='<div class="fg"><label>移动到</label><select id="mvCat">';for(var i=0;i<AC.length;i++)m2+='<option value="ac-'+i+'">学业-'+AC[i]+'</option>';for(var i=0;i<PS.length;i++)m2+='<option value="pt-'+i+'">党性-'+PS[i]+'</option>';for(var i=0;i<DS.length;i++)m2+='<option value="dc-'+i+'">纪律-'+DS[i]+'</option>';m2+='</select></div><div class="modal-acts"><button class="btn" onclick="closeModal()">取消</button><button class="btn btn-p" id="btnMoveConfirm">确定移动</button></div>';document.getElementById('modalBox').innerHTML=m2;document.getElementById('btnMoveConfirm').onclick=function(){var parts=document.getElementById('mvCat').value.split('-');var newCat=parts[0],newSi=parseInt(parts[1]);if(newCat==cat&&newSi==si){closeModal();return;}var tgt=getArr(newCat,newSi);if(!tgt){closeModal();return;}arr.splice(idx2,1);d.auto=false;tgt.push(d);if(!APP.learnedMap)APP.learnedMap={};var le={raw:d.raw,cf:1};if(newCat=='ac'){le.c='ac';le.i=newSi;le.n=AC[newSi];le.pts=d.score;le.l={n:d.level||'',k:d.lk||'ls'};}else if(newCat=='pt'){le.c='party';le.i=newSi;le.n=PS[newSi];le.p=d.score;}else{le.c='dc';le.i=newSi;le.n=DS[newSi];le.p=d.score;}APP.learnedMap[d.raw]=le;closeModal();render();if(!document.getElementById("viewSummary").classList.contains("hide"))renderSummaryTable();};document.getElementById('modalBg').style.display='flex';}
 function openAddModal(cat,si){openItemModal('添加条目',null,function(raw,score,lvl,lk){var arr=getArr(cat,si);if(!arr)return;arr.push({raw:raw,score:score,level:lvl,lk:lk,auto:false});closeModal();render();if(!document.getElementById("viewSummary").classList.contains("hide"))renderSummaryTable();},cat,si);}
 function openItemModal(title,d,saveFn,cat,si){var allSubs=AC.concat(PS).concat(DS),colIdx=cat=='ac'?si:(cat=='pt'?si+6:si+12),subName=allSubs[colIdx];var rawText=d?d.raw:'';var levelCat=getLevelCat(cat,si,rawText);var m2='<h3>'+title+' - '+subName+'</h3>';m2+='<div class="fg"><label>描述 *</label><input id="eRaw" value="'+(d?esc(d.raw):'')+'"></div>';if(levelCat=='__MERGED__'){
     var mergeOpts=[];
@@ -495,7 +664,7 @@ document.getElementById('fCat').onchange=function(){
 };
   document.getElementById('btnFix').onclick=function(){var idx2=parseInt(document.getElementById('fCat').value);var opt=catOpts[idx2],board=opt.board,si=opt.si,sc=parseFloat(document.getElementById('fScore').value)||0;var lvl='',lk='ls',lc=getLevelCat(board,si,'');if(lc&&R.levelAward[lc]){var li=parseInt(document.getElementById('fLv').value);lvl=R.levelAward[lc].lv[li];lk='ln';sc=R.levelAward[lc].sc[li];}if(/省/.test(lvl))lk='lp';else if(/市/.test(lvl))lk='lm';else if(/校/.test(lvl))lk='ls';else if(/院/.test(lvl))lk='ly';var arr=board=='ac'?m._cl.ac[si]:(board=='pt'?m._cl.pt[si]:m._cl.dc[si]);arr.push({raw:u.raw,score:sc,level:lvl,lk:lk,auto:false});if(!APP.learnedMap)APP.learnedMap={};var le={raw:u.raw,cf:1};if(board=='ac'){le.c='ac';le.i=si;le.n=AC[si];le.pts=sc;le.l={n:lvl||'',k:lk||'ls'};}else if(board=='pt'){le.c='party';le.i=si;le.n=PS[si];le.p=sc;}else{le.c='dc';le.i=si;le.n=DS[si];le.p=sc;}APP.learnedMap[u.raw]=le;m._unc.splice(idx,1);closeModal();render();if(!document.getElementById("viewSummary").classList.contains("hide"))renderSummaryTable();};document.getElementById('modalBg').style.display='flex';}
 function closeModal(){document.getElementById('modalBg').style.display='none';}
-var _sumSortCol=21,_sumSortDir=-1;
+var _sumSortCol=20,_sumSortDir=-1;
 function renderSummaryTable(){
   var simple=APP.summaryMode==='simple';
   var rows=[];
@@ -503,7 +672,7 @@ function renderSummaryTable(){
     if(simple){rows.push([i+1,mm['班级']||'',mm['姓名']||'',fin.acT,fin.ptT,fin.dcT,fin.t]);}
     else{var all18=fin.ac.concat(fin.pt).concat(fin.dc);rows.push([i+1,mm['班级']||'',mm['姓名']||''].concat(all18).concat([fin.t]));}}
   // 切换模式时自动修正排序列越界，防止 detail→simple 索引超出
-  var maxCol=simple?6:21;if(_sumSortCol>maxCol){_sumSortCol=maxCol;_sumSortDir=-1;}
+  var maxCol=simple?6:20;if(_sumSortCol>maxCol){_sumSortCol=maxCol;_sumSortDir=-1;}
   if(_sumSortCol>=0){rows.sort(function(a,b){var va=a[_sumSortCol]||0,vb=b[_sumSortCol]||0;return (va>vb?1:va<vb?-1:0)*_sumSortDir;});}
 
   var h='';
@@ -535,7 +704,7 @@ function renderSummaryTable(){
   }else{
     // ── 明细模式（原有完整逻辑，原封不动保留）──
     var allLabels=['序号','班级','姓名'].concat(AC).concat(PS).concat(DS).concat(['合计']);
-    h+='<thead><tr><th class="ch" colspan="3">基本信息</th><th class="ch" colspan="6" style="background:var(--blu)">学业</th><th class="ch" colspan="6" style="background:var(--red)">党性</th><th class="ch" colspan="6" style="background:var(--org)">纪律</th><th class="ch">合计</th></tr><tr>';
+    h+='<thead><tr><th class="ch" colspan="3">基本信息</th><th class="ch" colspan="6" style="background:var(--blu)">学业</th><th class="ch" colspan="6" style="background:var(--red)">党性</th><th class="ch" colspan="5" style="background:var(--org)">纪律</th><th class="ch">合计</th></tr><tr>';
     for(var j=0;j<allLabels.length;j++){
       var arrow='';if(j===_sumSortCol)arrow=' <span class="sort-arrow">'+( _sumSortDir>0?'▲':'▼')+'</span>';
       if(j===0)h+='<th class="ch col-sticky col-sticky-1" onclick="sortSummary('+j+')">'+allLabels[j]+arrow+'</th>';
@@ -594,7 +763,7 @@ function renderCriteria(){
 function addNewCrit(){var name=document.getElementById('newCritName').value.trim();if(!name)return alert('请输入名称');if(R.levelAward[name])return alert('已存在');var mode=document.getElementById('newCritMode').value;R.levelAward[name]={lv:['等级1','等级2','等级3'],sc:[3,2,1],mode:mode};if(mode=='per')R.levelAward[name].perVal=2;if(mode=='hourly'){R.levelAward[name].rate=0.5;R.levelAward[name].cap=10;}renderCriteria();}
 function chgMode(cn,m){R.levelAward[cn].mode=m;if(m=='per'&&!R.levelAward[cn].perVal)R.levelAward[cn].perVal=2;if(m=='hourly'&&!R.levelAward[cn].rate)R.levelAward[cn].rate=0.5;if(m=='hourly'&&!R.levelAward[cn].cap)R.levelAward[cn].cap=10;renderCriteria();}
 function updLvN(cn,i,v){R.levelAward[cn].lv[i]=v;}function updLvS(cn,i,v){R.levelAward[cn].sc[i]=v;}function addLvI(cn){R.levelAward[cn].lv.push('新等级');R.levelAward[cn].sc.push(1);renderCriteria();}function delLvI(cn,i){if(R.levelAward[cn].lv.length<=1)return;R.levelAward[cn].lv.splice(i,1);R.levelAward[cn].sc.splice(i,1);renderCriteria();}
-function reclassAll(){APP.learnedMap={};for(var i=0;i<APP.members.length;i++){APP.members[i]._ok=null;APP.members[i]._cl=null;APP.members[i]._unc=null;}}
+function reclassAll(){for(var i=0;i<APP.members.length;i++){_captureManualItems(APP.members[i]);APP.members[i]._ok=null;APP.members[i]._cl=null;APP.members[i]._unc=null;}}
 document.querySelectorAll('#mainTabs .tab').forEach(function(t){t.addEventListener('click',function(){switchMainTab(this.getAttribute('data-tab'));});});
 document.getElementById('btnOpenCrit').addEventListener('click',openCriteriaTab);
 document.getElementById('globalUncBadge').addEventListener('click',openGlobalUncertain);
@@ -603,18 +772,10 @@ document.addEventListener('keydown',function(e){if(e.target.tagName=='INPUT'||e.
 document.getElementById('searchMember').addEventListener('input',function(){var q=this.value.toLowerCase();document.querySelectorAll('.mitem').forEach(function(item){var txt=item.textContent.toLowerCase();item.style.display=(!q||txt.indexOf(q)>=0)?'':'none';});});
 var pf=null;
 document.getElementById('fileInput').addEventListener('change',function(e){var f=this.files[0];var btn=document.getElementById('btnProcess'),msg=document.getElementById('uploadMsg');if(!f){btn.disabled=true;msg.textContent='';pf=null;return;}pf=f;btn.disabled=false;msg.textContent='已选: '+f.name;msg.style.color='var(--grn)';});
-document.getElementById('btnProcess').addEventListener('click',function(){if(!pf)return;var file=pf,msg=document.getElementById('uploadMsg');msg.textContent='处理中...';msg.style.color='#333';setProcessLoading(true);var r=new FileReader();r.onload=function(ev){try{console.log('File read OK, parsing...');var wb=XLSX.read(new Uint8Array(ev.target.result),{type:'array'});var json=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});if(!json||!json.length){msg.textContent='表格为空或无数据，请检查文件';msg.style.color='red';setProcessLoading(false);return;}
-    // ── 基础字段校验：检查表头是否包含必要字段 ──
-    var headers=Object.keys(json[0]||{});
-    var hasName=headers.some(function(h){return h.indexOf('姓名')>=0||h.indexOf('名字')>=0;});
-    var hasClass=headers.some(function(h){return h.indexOf('班级')>=0||h.indexOf('班别')>=0;});
-    if(!hasName||!hasClass){msg.textContent='缺少必要字段：姓名、班级，请检查文件格式';msg.style.color='red';setProcessLoading(false);return;}
-    console.log('Parsed '+json.length+' rows, columns:',headers);var um=(document.querySelector('input[name=uploadMode]:checked')||{}).value||'append';
-    // ── 替换全部需二次确认 ──
-    if(um=='replace'&&APP.members.length>0){if(!confirm('⚠️ 替换全部将清空现有 '+APP.members.length+' 条成员数据，确定继续？')){msg.textContent='已取消导入';msg.style.color='var(--mut)';setProcessLoading(false);return;}APP.members=[];}var added=0,merged=0;for(var i=0;i<json.length;i++){var row=json[i],name=row['姓名']||row['名字']||'',cls=row['班级']||row['班别']||'';if(!name||!cls)continue;var found=null;for(var j=0;j<APP.members.length;j++){if((APP.members[j]['姓名']||APP.members[j]['名字']||'')==name&&(APP.members[j]['班级']||APP.members[j]['班别']||'')==cls){found=APP.members[j];break;}}if(found){var ea=found['获奖情况']||'',na=row['获奖情况']||'';if(na&&ea.indexOf(na.trim())<0)found['获奖情况']=ea+(ea?'\n':'')+na;var ep=found['参与学校、学院的活动（请罗列）']||'',np=row['参与学校、学院的活动（请罗列）']||'';if(np&&ep.indexOf(np.trim())<0)found['参与学校、学院的活动（请罗列）']=ep+(ep?'\n':'')+np;if(!found['学习成绩排名']&&row['学习成绩排名'])found['学习成绩排名']=row['学习成绩排名'];if(!found['综测排名']&&row['综测排名'])found['综测排名']=row['综测排名'];if(!found['职位（班级/部门）']&&row['职位（班级/部门）'])found['职位（班级/部门）']=row['职位（班级/部门）'];['是否挂科','是否违纪','是否旷课','志愿总时长'].forEach(function(k){if(row[k])found[k]=row[k];});found._ok=null;found._cl=null;found._unc=null;merged++;}else{row._ok=null;row._cl=null;row._unc=null;APP.members.push(row);added++;}}msg.textContent='新增'+added+'合并'+merged;msg.style.color='var(--grn)';sv();render();renderCriteria();setProcessLoading(false);toast('导入完成：新增 '+added+'，合并 '+merged);}catch(err){msg.textContent='解析失败: '+err.message;msg.style.color='red';setProcessLoading(false);toast('解析失败','err');console.error('Upload error:',err);}};r.onerror=function(){msg.textContent='读取失败';msg.style.color='red';setProcessLoading(false);toast('读取文件失败','err');};r.readAsArrayBuffer(file);});
-document.getElementById('btnAddMember').addEventListener('click',function(){var m2='<h3>添加成员</h3>';var fs=['姓名','班级','职位（班级/部门）','是否旷课','是否违纪','是否挂科','学习成绩排名','综测排名','志愿总时长','参与学校、学院的活动（请罗列）','获奖情况'];for(var i=0;i<fs.length;i++){m2+='<div class="fg"><label>'+fs[i]+(i<2?' *':'')+'</label>';if(i>=9)m2+='<textarea id="mf'+i+'" rows="3"></textarea>';else m2+='<input id="mf'+i+'">';m2+='</div>';}m2+='<div class="modal-acts"><button class="btn" onclick="closeModal()">取消</button><button class="btn btn-p" id="btnSaveMem">保存</button></div>';document.getElementById('modalBox').innerHTML=m2;document.getElementById('btnSaveMem').onclick=function(){var name=document.getElementById('mf0').value.trim(),cls=document.getElementById('mf1').value.trim();if(!name||!cls)return alert('姓名和班级必填');var mem={'姓名':name,'班级':cls,_ok:null,_cl:null,_unc:null};for(var i=2;i<fs.length;i++){mem[fs[i]]=document.getElementById('mf'+i).value;}APP.members.push(mem);APP.curIdx=APP.members.length-1;closeModal();render();if(!document.getElementById("viewSummary").classList.contains("hide"))renderSummaryTable();};document.getElementById('modalBg').style.display='flex';});
-document.getElementById('btnClearAll').addEventListener('click',function(){if(!confirm('确定清空全部 '+APP.members.length+' 人？'))return;APP.members=[];APP.curIdx=0;sv();render();});
-document.getElementById('btnSaveAll').addEventListener('click',function(){svNow();document.getElementById('statusBar').textContent='已保存 v'+APP_SCHEMA_VERSION;toast('数据已保存到浏览器');});
+document.getElementById('btnProcess').addEventListener('click',function(){if(pf)AppWorkflow.readImportFile(pf);});
+document.getElementById('btnAddMember').addEventListener('click',function(){AppWorkflow.addMember();});
+document.getElementById('btnClearAll').addEventListener('click',function(){if(!confirm('确定清空全部 '+APP.members.length+' 人？'))return;APP.members.slice().forEach(function(m){AdminCore.archive(APP,m._memberId);});APP.curIdx=0;svNow();render();});
+document.getElementById('btnSaveAll').addEventListener('click',function(){svNow();toast('已保存在本机；云端是否成功请查看顶部保存状态。');});
 
 document.getElementById('btnSaveCrit').addEventListener('click',function(){APP.criteriaVersion=APP_SCHEMA_VERSION;sv();reclassAll();render();renderCriteria();if(!document.getElementById('viewSummary').classList.contains('hide'))renderSummaryTable();document.getElementById('statusBar').textContent='评分标准已保存并重算';toast('评分标准已保存，全员分数已重算');});
 document.getElementById('btnReset').addEventListener('click',function(){if(confirm('恢复默认评分标准？')){APP.rules=JSON.parse(JSON.stringify(DEF));R=APP.rules;APP.criteriaVersion=APP_SCHEMA_VERSION;sv();renderCriteria();reclassAll();render();toast('已恢复默认评分标准');}});
@@ -656,7 +817,7 @@ document.getElementById('btnExport').addEventListener('click',function(){if(!APP
       XLSX.writeFile(wb2,'积分汇总_总分_'+new Date().toISOString().slice(0,10)+'.xlsx');
       toast('已导出简洁总分表');
     };
-  }else{for(var i=0;i<APP.members.length;i++)classifyMember(APP.members[i]);var rows=[['序号','班级','姓名','学业能力','','','','','','党性成长','','','','','','纪律约束','','','','','','合计']];rows.push(['','',''].concat(AC).concat(PS).concat(DS).concat(['']));for(var i=0;i<APP.members.length;i++){var mm=APP.members[i],fin=calc(mm,false);var row=[i+1,mm['班级']||'',mm['姓名']||''];for(var j=0;j<fin.ac.length;j++)row.push(+fin.ac[j].toFixed(2));for(var j=0;j<fin.pt.length;j++)row.push(+fin.pt[j].toFixed(2));for(var j=0;j<fin.dc.length;j++)row.push(+fin.dc[j].toFixed(2));row.push(+fin.t.toFixed(2));rows.push(row);}var ws=XLSX.utils.aoa_to_sheet(rows);ws['!merges']=[{s:{r:0,c:0},e:{r:1,c:0}},{s:{r:0,c:1},e:{r:1,c:1}},{s:{r:0,c:2},e:{r:1,c:2}},{s:{r:0,c:3},e:{r:0,c:8}},{s:{r:0,c:9},e:{r:0,c:14}},{s:{r:0,c:15},e:{r:0,c:20}},{s:{r:0,c:21},e:{r:1,c:21}}];var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'积分汇总表');
+  }else{for(var i=0;i<APP.members.length;i++)classifyMember(APP.members[i]);var rows=[['序号','班级','姓名','学业能力','','','','','','党性成长','','','','','','纪律约束','','','','','合计']];rows.push(['','',''].concat(AC).concat(PS).concat(DS).concat(['']));for(var i=0;i<APP.members.length;i++){var mm=APP.members[i],fin=calc(mm,false);var row=[i+1,mm['班级']||'',mm['姓名']||''];for(var j=0;j<fin.ac.length;j++)row.push(+fin.ac[j].toFixed(2));for(var j=0;j<fin.pt.length;j++)row.push(+fin.pt[j].toFixed(2));for(var j=0;j<fin.dc.length;j++)row.push(+fin.dc[j].toFixed(2));row.push(+fin.t.toFixed(2));rows.push(row);}var ws=XLSX.utils.aoa_to_sheet(rows);ws['!merges']=[{s:{r:0,c:0},e:{r:1,c:0}},{s:{r:0,c:1},e:{r:1,c:1}},{s:{r:0,c:2},e:{r:1,c:2}},{s:{r:0,c:3},e:{r:0,c:8}},{s:{r:0,c:9},e:{r:0,c:14}},{s:{r:0,c:15},e:{r:0,c:19}},{s:{r:0,c:20},e:{r:1,c:20}}];var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'积分汇总表');
   // Add criteria sheet
   var critRows=[['类别','模式','等级/项','分值']];
   for(var cn in R.levelAward){var c=R.levelAward[cn];if(c.mode=='level'){for(var j=0;j<c.lv.length;j++)critRows.push([cn,'等级制',c.lv[j],c.sc[j]]);}
@@ -669,9 +830,16 @@ document.getElementById('btnExport').addEventListener('click',function(){if(!APP
   var cs=XLSX.utils.aoa_to_sheet(critRows);cs['!cols']=[{wch:18},{wch:10},{wch:20},{wch:8}];XLSX.utils.book_append_sheet(wb,cs,'评分标准');
   XLSX.writeFile(wb,'积分汇总_明细_'+new Date().toISOString().slice(0,10)+'.xlsx');toast('已导出明细汇总表');}});
 document.getElementById('btnExportDetail').addEventListener('click',function(){if(!APP.members.length)return;var m=APP.members[APP.curIdx];classifyMember(m);var fin=calc(m,APP.coef);var rows=[[m['姓名']+' - '+m['班级']+' 积分明细']];rows.push(['板块','子项','描述','等级','得分']);var ad=[];for(var j=0;j<6;j++){var items=m._cl.ac[j]||[];for(var k=0;k<items.length;k++)ad.push(['学业能力',AC[j],items[k].raw,items[k].level||'',items[k].score]);}for(var j=0;j<6;j++){var items=m._cl.pt[j]||[];for(var k=0;k<items.length;k++)ad.push(['党性成长',PS[j],items[k].raw,items[k].level||'',items[k].score]);}for(var j=0;j<6;j++){var items=m._cl.dc[j]||[];for(var k=0;k<items.length;k++)ad.push(['纪律约束',DS[j],items[k].raw,items[k].level||'',items[k].score]);}for(var j=0;j<ad.length;j++)rows.push(ad[j]);rows.push(['','','','总分',fin.t]);var ws=XLSX.utils.aoa_to_sheet(rows);ws['!cols']=[{wch:12},{wch:16},{wch:60},{wch:16},{wch:10}];var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'个人明细');XLSX.writeFile(wb,(m['姓名']||'成员')+'_积分明细.xlsx');});
-document.getElementById('btnBackup').addEventListener('click',function(){var bk={rules:APP.rules,members:APP.members,curIdx:APP.curIdx,coef:APP.coef,learnedMap:APP.learnedMap,date:new Date().toISOString(),schemaVersion:APP_SCHEMA_VERSION,criteriaVersion:APP.criteriaVersion||APP_SCHEMA_VERSION,version:'v10'};var blob=new Blob([JSON.stringify(bk,null,2)],{type:'application/json'});var url=URL.createObjectURL(blob);var a=document.createElement('a');a.href=url;a.download='积分备份_'+new Date().toISOString().slice(0,10)+'.json';a.click();URL.revokeObjectURL(url);toast('备份文件已下载');});
-document.getElementById('restoreFile').addEventListener('change',function(e){var f=this.files[0];if(!f||!confirm('恢复备份将替换当前数据！'))return;var r=new FileReader();r.onload=function(ev){try{console.log('File read OK, parsing...');var bk=JSON.parse(ev.target.result);if(!bk.rules||!bk.members)return alert('无效备份');APP.rules=bk.rules;R=APP.rules;APP.members=bk.members;APP.curIdx=bk.curIdx||0;APP.coef=!!bk.coef;APP.learnedMap=bk.learnedMap||{};APP.schemaVersion=bk.schemaVersion||(bk.version==='v10'?10:9);APP.criteriaVersion=bk.criteriaVersion||APP.schemaVersion;svNow();try{renderCriteria();render();updateUncStats();toast('备份已恢复');}catch(e){document.getElementById('statusBar').textContent='初始化错误: '+e.message;console.error(e);}}catch(err){alert('解析失败: '+err.message);}};r.readAsText(f);});
-document.getElementById('btnTpl').addEventListener('click',function(){var tr=[['序号','姓名','班级','职位（班级/部门）','是否旷课','是否违纪','是否挂科','学习成绩排名','综测排名','志愿总时长','参与学校、学院的活动（请罗列）','获奖情况']];for(var i=1;i<=15;i++)tr.push([String(i),'','','','','','','','','','','']);var ws=XLSX.utils.aoa_to_sheet(tr);ws['!cols']=[{wch:6},{wch:10},{wch:20},{wch:20},{wch:8},{wch:8},{wch:8},{wch:12},{wch:12},{wch:12},{wch:40},{wch:40}];var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Sheet1');XLSX.writeFile(wb,'信息收集表模版.xlsx');});
+document.getElementById('btnBackup').addEventListener('click',function(){_downloadFullBackup();toast('完整备份已下载，包含批次、勾选名单和历史筛选结果。');});
+document.getElementById('restoreFile').addEventListener('change',async function(){
+  var file=this.files[0];this.value='';if(!file||!confirm('恢复备份将替换当前工作数据（包括批次和筛选名单），不会自动合并。继续？'))return;
+  try{var data=JSON.parse((await file.text()).replace(/^\uFEFF/,''));if(!data.rules||!Array.isArray(data.members))throw new Error('不是完整积分备份。');
+    _downloadFullBackup('恢复前备份');clearTimeout(_svTimer);_svTimer=null;_applyData(data);_lastSavedPayload=null;svNow();toast('备份已在本机恢复，请确认云端保存成功。');
+  }catch(e){toast('恢复失败：'+e.message,'err');}
+});
+document.getElementById('btnTpl').addEventListener('click',function(){
+  var a=document.createElement('a');a.href='assets/information-template-examples.xlsx';a.download='国际交流学院信息收集表_含填写示例.xlsx';document.body.appendChild(a);a.click();a.remove();
+});
 document.getElementById('btnShowSummary').addEventListener('click',function(){
   document.getElementById('viewPersonal').classList.add('hide');document.getElementById('emptyState').classList.add('hide');
   document.getElementById('viewSummary').classList.remove('hide');renderSummaryTable();
@@ -679,54 +847,15 @@ document.getElementById('btnShowSummary').addEventListener('click',function(){
 document.getElementById('modalBg').addEventListener('click',function(e){if(e.target===this)closeModal();});
 // Paste zone click
 document.getElementById('pasteZone').addEventListener('click',function(){document.getElementById('statusBar').textContent='请按 Ctrl+V 粘贴表格数据';});
-// Paste event
+// Paste tables use exactly the same duplicate check and batch preview as Excel.
 document.addEventListener('paste',function(e){
-  if(e.target.tagName=='INPUT'||e.target.tagName=='TEXTAREA'||e.target.tagName=='SELECT')return;
-  var html=(e.clipboardData||window.clipboardData).getData('text/html');
-  if(!html||html.indexOf('<table')<0)return;
-  e.preventDefault();
-  var temp=document.createElement('div');temp.innerHTML=html;
-  var table=temp.querySelector('table');if(!table)return;
-  var rows=table.querySelectorAll('tr');
-  var preview='<table class="preview-table">';var count=0;
-  for(var i=0;i<Math.min(rows.length,10);i++){
-    var cells=rows[i].querySelectorAll('td,th');preview+='<tr>';
-    for(var j=0;j<cells.length;j++)preview+='<'+(i==0?'th':'td')+'>'+cells[j].textContent.substring(0,60)+'</'+(i==0?'th':'td')+'>';
-    preview+='</tr>';if(i>0)count++;
-  }
-  preview+='</table>';
-  if(rows.length>10)preview+='<div style="color:#999;font-size:12px">... 还有 '+(rows.length-10)+' 行</div>';
-  var m2='<h3>📋 粘贴表格预览</h3>'+preview+'<div style="margin-top:8px;font-size:13px;color:var(--mut)">共 <b>'+count+'</b> 行数据</div>';
-  m2+='<div class="modal-acts"><button class="btn" onclick="closeModal()">取消</button><button class="btn btn-p" id="btnPasteConfirm">确认导入</button></div>';
-  document.getElementById('modalBox').innerHTML=m2;
-  document.getElementById('modalBg').style.display='flex';
-  document.getElementById('btnPasteConfirm').onclick=function(){
-    closeModal();
-    var data=[];
-    var allRows=table.querySelectorAll('tr');if(allRows.length<2)return;
-    var hdrCells=allRows[0].querySelectorAll('td,th');
-    var hdrs=[];for(var i=0;i<hdrCells.length;i++)hdrs.push(hdrCells[i].textContent.trim());
-    for(var i=1;i<allRows.length;i++){
-      var cells=allRows[i].querySelectorAll('td,th');
-      var row={};for(var j=0;j<cells.length;j++){if(hdrs[j])row[hdrs[j]]=cells[j].textContent.trim();}
-      if(Object.keys(row).length>0){row._ok=null;row._cl=null;row._unc=null;data.push(row);}
-    }
-    if(!data.length)return;
-    var um=(document.querySelector('input[name=uploadMode]:checked')||{}).value||'append';
-    if(um=='replace'){if(APP.members.length>0&&!confirm('⚠️ 替换全部将清空现有 '+APP.members.length+' 条成员数据，确定继续？')){closeModal();return;}APP.members=[];}
-    var added=0,merged=0;
-    for(var i=0;i<data.length;i++){
-      var row=data[i],name=row['姓名']||row['名字']||'',cls=row['班级']||row['班别']||'';
-      if(!name||!cls){APP.members.push(row);added++;continue;}
-      var found=null;
-      for(var j=0;j<APP.members.length;j++){if((APP.members[j]['姓名']||APP.members[j]['名字']||'')==name&&(APP.members[j]['班级']||APP.members[j]['班别']||'')==cls){found=APP.members[j];break;}}
-      if(found){var ea=found['获奖情况']||'',na=row['获奖情况']||'';if(na&&ea.indexOf(na.trim())<0)found['获奖情况']=ea+(ea?'\n':'')+na;var ep=found['参与学校、学院的活动（请罗列）']||'',np=row['参与学校、学院的活动（请罗列）']||'';if(np&&ep.indexOf(np.trim())<0)found['参与学校、学院的活动（请罗列）']=ep+(ep?'\n':'')+np;['是否挂科','是否违纪','是否旷课','志愿总时长'].forEach(function(k){if(row[k])found[k]=row[k];});found._ok=null;found._cl=null;found._unc=null;merged++;}
-      else{APP.members.push(row);added++;}
-    }
-    sv();render();renderCriteria();
-    document.getElementById('statusBar').textContent='粘贴导入: 新增'+added+'合并'+merged;
-    toast('粘贴导入完成：新增 '+added+'，合并 '+merged);
-  };
+  if(/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)||e.target.isContentEditable)return;
+  var html=(e.clipboardData||window.clipboardData).getData('text/html');if(!html||html.indexOf('<table')<0)return;
+  e.preventDefault();var temp=document.createElement('div');temp.innerHTML=html;
+  var table=temp.querySelector('table');if(!table)return;var rows=table.querySelectorAll('tr');if(rows.length<2)return;
+  var headers=Array.from(rows[0].querySelectorAll('td,th')).map(function(c){return c.textContent.trim();});
+  var data=Array.from(rows).slice(1).map(function(tr){var row={};Array.from(tr.querySelectorAll('td,th')).forEach(function(c,i){if(headers[i]&&headers[i][0]!=='_')row[headers[i]]=c.textContent.trim();});return row;});
+  AppWorkflow.previewImport(data,'粘贴表格');
 });
 // Drag-drop
 var dz=document.getElementById('dropZone');
@@ -738,7 +867,7 @@ dz.addEventListener('drop',function(e){e.preventDefault();this.classList.remove(
   var btnModeSimple=document.getElementById('btnModeSimple');
   if(btnModeDetail)btnModeDetail.addEventListener('click',function(){
     if(APP.summaryMode==='detail')return;
-    APP.summaryMode='detail';_sumSortCol=21;_sumSortDir=-1;APP._sortCol=_sumSortCol;APP._sortDir=_sumSortDir;sv();
+    APP.summaryMode='detail';_sumSortCol=20;_sumSortDir=-1;APP._sortCol=_sumSortCol;APP._sortDir=_sumSortDir;sv();
     if(!document.getElementById('viewSummary').classList.contains('hide'))renderSummaryTable();
   });
   if(btnModeSimple)btnModeSimple.addEventListener('click',function(){
@@ -757,5 +886,7 @@ if(!CLOUD_ENABLED){
   if(_btnLogout)_btnLogout.style.display='none';
   try{renderCriteria();render();updateUncStats();}catch(e){document.getElementById('statusBar').textContent='初始化错误: '+e.message;console.error(e);}
 }else{
-  _tryAutoLogin().catch(function(){document.getElementById('loginBg').classList.add('on');});
+  try{localStorage.removeItem('pps_ck');}catch(e){}
+  document.getElementById('loginBg').classList.add('on');
+  _tryAutoLogin();
 }

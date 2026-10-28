@@ -5,16 +5,20 @@
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>党员发展积分管理系统 · 国际交流学院</title>
 <script src="xlsx.full.min.js"></script>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=rules-reference-19">
 </head>
 <body>
 <div class="topbar">
-  <div class="topbar-brand"><h1>🏛 党员发展积分管理系统 <span class="tag">国际交流学院</span></h1></div>
+  <div class="topbar-brand"><span class="college-emblem"><img src="assets/college-emblem.jpg" alt="广州航海学院国际交流学院院徽" width="44" height="44"></span><h1>党员发展积分管理系统 <span class="tag">国际交流学院</span></h1></div>
   <div class="topbar-actions">
+    <span id="cloudSaveState" title="请以此处状态确认云端是否保存成功" aria-describedby="workspaceSaveGuide" class="cloud-save-state" role="status" aria-live="polite">等待登录</span>
     <button type="button" class="topbar-unc hide" id="globalUncBadge" title="点击查看不确定项">待处理 0 项</button>
+    <button type="button" id="scoringRulesLink" class="btn btn-o" aria-haspopup="dialog" aria-controls="scoringRulesDialog">评分细则</button>
+    <button type="button" id="adminManualLink" class="btn btn-o admin-manual-link" aria-haspopup="dialog" aria-controls="adminManualDialog">操作手册</button>
+    <button class="btn btn-o" id="btnWorkflow">批次与汇总筛选</button>
     <button class="btn btn-o" id="btnExport">📤 导出汇总</button>
     <span class="export-hint hide" id="exportHint"></span>
-    <button class="btn btn-p" id="btnSaveAll">💾 保存</button>
+    <button class="btn btn-p" id="btnSaveAll" title="手动提交保存或在普通保存失败后重试；是否成功以顶部云端状态为准">💾 保存</button>
     <div class="topbar-more">
       <button type="button" class="btn btn-o" id="btnMore">⋮ 更多</button>
       <div class="topbar-more-menu" id="topbarMoreMenu">
@@ -27,9 +31,10 @@
   </div>
 </div>
 <div class="app">
-<div class="sidebar">
+<div class="sidebar" id="workspaceSidebar">
+<button type="button" id="workspaceNavToggle" class="btn workspace-collapse-nav" aria-controls="workspaceSidebar" aria-expanded="true">收起导航 ‹</button>
 <div class="sidebar-accent"></div>
-<div class="sec">
+<div class="sec" id="uploadSection">
   <input type="checkbox" id="foldUpload" class="sidebar-toggle" checked>
   <label for="foldUpload" class="sidebar-fold-label">上传与导入</label>
   <div class="sidebar-collapsible">
@@ -38,17 +43,20 @@
     <input type="file" id="fileInput" accept=".xlsx,.xls">
     <button class="btn btn-p" id="btnProcess" disabled style="width:100%;margin-top:8px">开始处理</button>
     <div id="uploadMsg" style="margin-top:6px;font-size:12px"></div>
-    <div class="mode-row"><label><input type="radio" name="uploadMode" value="append" checked> 追加合并</label><label><input type="radio" name="uploadMode" value="replace"> 替换全部</label></div>
+<p class="workflow-upload-note">导入前核对重复人员，选择录入批次；保留历史人员。</p>
     <div class="paste-zone" id="pasteZone">📋 或 Ctrl+V 粘贴表格</div>
   </div>
   </div>
 </div>
-<div class="sec">
+<div class="sec" id="memberSection">
   <input type="checkbox" id="foldMembers" class="sidebar-toggle" checked>
-  <label for="foldMembers" class="sidebar-fold-label">成员列表 <span class="count" id="sideCount">0</span></label>
+  <label for="foldMembers" class="sidebar-fold-label">选择学生 <span class="count" id="sideCount">0</span></label>
   <div class="sidebar-collapsible">
-  <input type="text" class="search" id="searchMember" placeholder="🔍 搜索姓名或班级...">
+  <input type="text" class="search" id="searchMember" placeholder="搜索姓名、班级或学号">
+  <select id="memberClassFilter" class="people-class-filter" aria-label="按班级筛选"><option value="">全部班级</option></select>
+  <div class="people-list-meta" id="memberListMeta"></div>
   <div class="mlist" id="memberList"><div class="list-empty">暂无成员</div></div>
+  <div id="memberSearchEmpty" class="people-search-empty hide">没有符合条件的同学，请更换关键词或班级。</div>
   <div class="member-actions">
     <button class="btn btn-s" id="btnAddMember" style="flex:1">➕ 添加</button>
     <button class="btn btn-d btn-s" id="btnClearAll" style="flex:1">🗑 清空</button>
@@ -60,6 +68,24 @@
 </div>
 <div class="main" id="mainContent">
 <div class="page-shell">
+<div id="workspaceRoutebar" class="workspace-routebar"></div>
+<details id="workspaceSaveGuide" class="workspace-save-guide">
+  <summary>保存说明：日常修改会自动保存，关闭页面前请确认顶部显示“已保存到云端”。</summary>
+  <div class="workspace-save-guide-body">
+    <p><strong>日常操作：</strong>导入资料、修改积分、勾选人员等操作会自动保存，通常不用再点顶部“保存”。</p>
+    <p><strong>确认同步：</strong>“正在保存到云端”时请稍等；显示“已保存到云端＋时间”才表示同步成功，其他电脑重新读取后才能看到。</p>
+    <p><strong>保存失败：</strong>不要直接关闭页面。可先导出完整备份；普通保存失败可点顶部“保存”重试，保存冲突则按提示备份本机修改并读取云端最新版，不要反复强行提交。</p>
+    <p><strong>保存筛选结果：</strong>自动保存只保留当前工作状态。要留存本次名单、分数和评分依据，仍需点击“保存筛选结果”，并等顶部确认云端保存成功。</p>
+  </div>
+</details>
+<section id="workspaceDashboard" class="hide"></section>
+<section id="workspaceReview" class="workspace-page hide"></section>
+<section id="workspaceImport" class="workspace-page hide"><div class="workspace-page-title"><span>资料录入</span><h2>导入或补充学生资料</h2><p>新同学录入、老同学补充材料都从这里开始。确认匹配人员后再提交，不会清空历史资料。</p></div><div class="workspace-import-layout"><div id="workspaceImportHost"></div><aside class="workspace-help"><h3>填写与导入提醒</h3><ol><li>姓名和班级必填，有学号时优先按学号匹配。</li><li>新奖项与活动会追加；同一条材料不会重复追加。</li><li>志愿时长填写更新后的累计总时长。</li><li>预览里核对“新增／更新／身份冲突”，再选择批次。</li></ol><button class="btn btn-p" id="workspaceDownloadTemplate">下载带示例的模板</button></aside></div></section>
+<section id="workspaceMembers" class="workspace-members hide"><header class="people-board-heading"><button type="button" id="workspacePeopleToggle" class="btn workspace-collapse-people" aria-controls="workspacePeopleHost" aria-expanded="true">收起学生列表 ‹</button><div><span>人员档案</span><h2>人员与积分</h2><p>左侧查找同学，右侧查看总分、分项和待审核材料。</p></div><button class="btn" data-workspace="import">补充学生资料</button></header><div class="workspace-people-column" id="workspacePeopleHost"></div><div class="workspace-person-column" id="workspacePersonHost"><div id="workspaceNoPerson" class="workspace-help hide"><h2>还没有学生资料</h2><p>先到“资料导入”上传收集表，再在这里查看人员及分数。</p><button class="btn btn-p" data-workspace="import">去导入资料</button></div></div></section>
+<section id="workspaceCriteria" class="workspace-page hide"><div class="workspace-page-title"><span>规则设置</span><h2>评分标准</h2><p>沿用学院现有分值、权重与上限。修改并重算前，请核对本次筛选的统计口径。</p></div><div id="workspaceCriteriaHost"></div></section>
+<section id="workspaceBackup" class="workspace-page hide"><div class="workspace-page-title"><span>数据管理</span><h2>备份与恢复</h2><p>完整备份包含人员资料、回收站、修改记录、批次、已选名单和历史筛选结果。</p></div><div class="workspace-backup-grid"><article class="workspace-help"><h3>导出完整备份</h3><p>导入大量资料、修改规则或移除人员前，可以先保留一份备份。</p><button class="btn btn-p" id="workspaceDownloadBackup">下载完整备份</button></article><article class="workspace-help"><h3>恢复完整备份</h3><p>恢复会替换当前工作数据，不会自动合并；操作前系统会下载恢复前的备份。</p><button class="btn btn-d" id="workspaceRestoreBackup">选择备份文件</button></article></div></section>
+
+<div id="workflowView" class="hide"></div>
 <div class="empty-state" id="emptyState">
   <div class="icon">📂</div>
   <div class="empty-title">请先在左侧上传信息收集表</div>
@@ -75,13 +101,9 @@
   <div class="tbl-wrap"><table class="tbl" id="summaryTable"></table></div>
 </div>
 <div class="main-content hide" id="viewPersonal">
-<div class="member-header">
-  <span class="mh-name" id="mhName">—</span>
-  <span class="mh-class" id="mhClass">—</span>
-  <span style="flex:1"></span>
-  <label><input type="checkbox" id="coefCb"> 前期×0.6</label>
-  <button class="btn btn-p btn-s" id="btnExportDetail">📥 导出明细</button>
-  <button class="btn btn-b btn-s" id="btnShowSummary">📊 查看汇总表</button>
+<div class="member-header person-profile">
+  <div class="person-profile-identity"><span class="person-profile-kicker">学生档案</span><div class="person-profile-name"><span class="mh-name" id="mhName">—</span><span class="mh-class" id="mhClass">—</span></div><p id="personProfileMeta" class="person-profile-meta"></p><span id="personReviewStatus" class="person-review-status"></span></div>
+  <div class="person-profile-actions"><button class="btn btn-p" id="btnExportDetail">导出明细</button><details class="person-more-actions"><summary>更多操作</summary><div class="person-more-menu"><button class="btn" id="btnShowSummary">查看全部积分汇总</button><label><input type="checkbox" id="coefCb"> 采用前期 ×0.6 系数</label><button class="btn btn-d" id="workspaceRemoveMember">移入人员回收站</button></div></details></div>
 </div>
 <div class="score-section" id="scoreSection">
 <div class="cards" id="scoreCards">
@@ -92,20 +114,20 @@
 </div>
 <div class="warn" id="warnBox"></div>
 </div>
-<div class="tabs" id="mainTabs">
-  <div class="tab active" data-tab="overview">📊 积分总览</div>
-  <div class="tab" data-tab="detail">📝 评分明细</div>
-  <div class="tab" data-tab="uncertain">⚠️ 不确定项 <span class="badge" id="uncBadge">0</span></div>
+<div class="tabs" id="mainTabs" role="tablist" aria-label="学生积分与材料">
+  <button type="button" class="tab active" data-tab="overview" role="tab">分项总览</button>
+  <button type="button" class="tab" data-tab="detail" role="tab">材料与评分明细</button>
+  <button type="button" class="tab" data-tab="uncertain" role="tab">待审核材料 <span class="badge" id="uncBadge">0</span></button>
   <div class="tab" data-tab="criteria">📋 评分标准</div>
 </div>
-<div id="panelOverview" class="tbl-wrap"><table class="tbl" id="scoreTable"></table></div>
+<div id="panelOverview"><p class="person-overview-hint">按板块查看分数，点击分项可查看和调整条目。材料原文在“材料与评分明细”中查看。</p><div id="personOverviewGroups" class="person-overview-groups"></div><div class="hide" aria-hidden="true"><table class="tbl" id="scoreTable"></table></div></div>
 <div id="panelDetail" class="hide"><div class="dgrid" id="detailGrid"></div></div>
 <div id="panelUncertain" class="hide"><div id="uncList"></div></div>
 <div id="panelCriteria" class="hide">
   <div class="criteria-toolbar">
     <button class="btn btn-p" id="btnSaveCrit">💾 保存修改并重算</button>
     <button class="btn btn-d" id="btnReset">↩ 恢复默认</button>
-    <span class="crit-version" id="critVersionLabel">评分标准版本 v10</span>
+    <span class="crit-version hide" id="critVersionLabel" hidden aria-hidden="true">评分标准版本 v10</span>
   </div>
   <div class="crit-grid2" id="critPanel"></div>
 </div>
@@ -114,20 +136,184 @@
 </div>
 </div>
 <div class="modal-bg" id="modalBg"><div class="modal-box" id="modalBox"></div></div>
+<div id="cloudConflictBanner" class="cloud-conflict-banner hide" role="alert"><strong>其他电脑已经保存更新，本机未覆盖云端。</strong><span>请先备份当前修改，再读取最新版核对。</span><button class="btn" onclick="_downloadFullBackup('未同步修改备份')">备份本机修改</button><button class="btn" onclick="reloadLatestCloud()">备份并读取云端最新版</button></div>
+<div id="workflowDialog" class="workflow-dialog hide"><section class="workflow-dialog-box" role="dialog" aria-modal="true" aria-labelledby="workflowDialogTitle"><header><h2 id="workflowDialogTitle"></h2><button class="btn" id="workflowDialogClose" aria-label="关闭">关闭</button></header><div id="workflowDialogBody"></div><footer id="workflowDialogActions"></footer></section></div>
 <div class="login-bg" id="loginBg">
-  <div class="login-box">
-    <div class="login-logo">🏛</div>
-    <div class="login-title">党员发展积分管理系统</div>
-    <div class="login-sub">多设备数据同步 · 请输入共享密码</div>
-    <input type="password" id="loginPwd" class="login-input" placeholder="共享密码" autocomplete="current-password">
+  <div class="login-box" role="dialog" aria-modal="true" aria-labelledby="adminLoginTitle">
+    <div class="login-title" id="adminLoginTitle">学院党员积分管理</div>
+    <div class="login-sub">学院内部管理员登录 · 多设备共享数据</div><p class="login-session-note" style="font-size:12px;color:#897a68;margin-bottom:14px;line-height:1.7">本窗口登录后刷新可自动恢复，最长保留 8 小时；主动退出会清除登录状态。公用电脑用完请点击“退出登录”。</p>
+    <label for="loginUsername">管理员账号</label>
+    <input type="text" id="loginUsername" class="login-input" value="administrator" autocomplete="username">
+    <label for="loginAccountPwd">管理员登录密码</label>
+    <input type="password" id="loginAccountPwd" class="login-input" autocomplete="current-password" placeholder="输入旧环境管理员密码">
+    <input type="hidden" id="loginPwd" value="">
     <button type="button" class="btn btn-p" id="btnLogin" style="width:100%;margin-top:12px">登录</button>
-    <div class="login-err" id="loginErr"></div>
+    <details id="recoverySection" style="margin-top:14px;text-align:left">
+      <summary>管理员恢复历史数据（非常规登录步骤）</summary>
+      <p>仅用于维护管理员恢复遗忘密码的旧数据，整个系统只需恢复一次。其他电脑直接登录，不需要上传备份。</p>
+      <label for="recoveryFile">选择完整 JSON 备份</label>
+      <input id="recoveryFile" type="file" accept=".json,application/json">
+      <button id="btnRecover" type="button" class="btn btn-p" onclick="recoverFromBackup()">验证管理员并从备份恢复</button>
+    </details>
+    <div class="login-err" id="loginErr" role="status" aria-live="polite"></div>
   </div>
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <div class="status hide" aria-hidden="true"><span id="statusBar">系统就绪 v10</span></div>
+<dialog id="adminManualDialog" class="manual-dialog" aria-labelledby="manualDialogTitle"><header class="manual-dialog-header"><div><span>使用帮助</span><h2 id="manualDialogTitle">管理员操作手册</h2></div><div class="manual-header-actions"><a class="btn" href="https://my.feishu.cn/wiki/MRu5wR9DWizjAmkHzUCceWjJnpd" target="_blank" rel="noopener noreferrer">飞书原文 ↗</a><button type="button" id="manualDialogClose" class="btn" aria-label="关闭操作手册" title="关闭操作手册">×</button></div></header><div class="manual-dialog-body"><nav class="manual-toc" aria-label="操作手册目录"><button type="button" data-manual-target="manualIntro">01 快速上手</button><button type="button" data-manual-target="manualChapter1">02 登录与保存</button><button type="button" data-manual-target="manualChapter2">03 导入新同学和补充旧资料</button><button type="button" data-manual-target="manualChapter3">04 查看积分和人工审核</button><button type="button" data-manual-target="manualChapter4">05 跨批次筛选和留存结果</button><button type="button" data-manual-target="manualChapter5">06 回收站 修改记录和备份</button><button type="button" data-manual-target="manualChapter6">07 常见问题和交接检查</button></nav><article id="manualDialogArticle" tabindex="0" aria-label="操作手册正文"><div id="manualIntro" class="manual-chapter"><h2>快速上手</h2></div>
+<p>国际交流学院 · 适用于当前新版管理界面 · 2026年10月28日</p>
+<p>本手册供新接手的管理员查阅。日常工作按“导入资料、核对材料、勾选人员、留存结果”的顺序进行。积分认定以学院现行办法为准；系统识别不清楚的材料，需要人工核对。</p>
+<p>最重要的两件事：日常修改会自动保存，但关闭页面前要确认“已保存到云端”；要保留某次筛选的名单和当时分数，仍须点击“保存筛选结果”。</p>
+<h3>第一次使用先做这几步</h3>
+<p class="manual-step"><strong>1.</strong><span>使用维护人员提供的正式网址和管理员账号登录，不需要每台电脑上传旧数据。</span></p>
+<p class="manual-step"><strong>2.</strong><span>进入“资料导入”下载模板，收齐后先核对导入预览。</span></p>
+<p class="manual-step"><strong>3.</strong><span>到“待审核材料”确认不清楚的材料，再进入“批次与筛选”选人。</span></p>
+<p class="manual-step"><strong>4.</strong><span>填写统一统计口径，保存筛选结果并导出，最后确认云端已保存。</span></p>
+<h3>各板块查看什么</h3>
+<div class="manual-table-wrap"><table><thead><tr><th scope="col">板块</th><th scope="col">主要用途</th></tr></thead><tbody><tr><td>工作台</td><td>查看人员总数、待审核人数和本次已选人数。</td></tr><tr><td>资料导入</td><td>下载模板，导入新同学或补充老同学资料。</td></tr><tr><td>人员与积分</td><td>按姓名、班级或学号找人，查看分项及人工核对。</td></tr><tr><td>批次与筛选</td><td>跨批次选人，汇总排名，保存或导出本次结果。</td></tr><tr><td>待审核材料</td><td>核对级别、职务等不明确的内容，支持连续审核。</td></tr><tr><td>全部积分汇总</td><td>查看全体人员积分，不等于本次勾选名单。</td></tr><tr><td>历史筛选结果</td><td>查看、导出过去已保存的结果。</td></tr><tr><td>人员回收站</td><td>单独恢复误移除的同学，或永久删除。</td></tr><tr><td>修改记录</td><td>查看近期关键操作及修改前后的内容。</td></tr><tr><td>评分标准及备份与恢复</td><td>核对现行规则，下载或恢复完整备份。</td></tr></tbody></table></div>
+<h2 id="manualChapter1" class="manual-chapter">登录与保存</h2>
+<h3>登录和刷新</h3>
+<p class="manual-step"><strong>1.</strong><span>输入管理员账号和密码登录。刷新同一窗口时，系统会尝试恢复登录，并读取云端最新数据。</span></p>
+<p class="manual-step"><strong>2.</strong><span>当前窗口的登录会话最长保留8小时。主动退出、会话过期、身份验证失败或无法恢复时，需要重新登录。</span></p>
+<p class="manual-step"><strong>3.</strong><span>公用电脑使用结束后，点击顶部更多操作中的“退出登录”。系统不保存登录密码。</span></p>
+<p>不要把 http://127.0.0.1:8080/ 发给其他电脑使用，它是本机测试地址。其他管理员应使用维护人员提供的正式网址。</p>
+<h3>看顶部状态判断是否保存成功</h3>
+<div class="manual-table-wrap"><table><thead><tr><th scope="col">顶部状态</th><th scope="col">应怎样操作</th></tr></thead><tbody><tr><td>等待保存或正在保存</td><td>先等待，不要立即关闭或刷新。</td></tr><tr><td>已保存到云端</td><td>当前修改已经同步，可让另一窗口刷新查看。</td></tr><tr><td>未登录或仅保存在本机</td><td>不能视为已共享给其他管理员；先确认登录和网络。</td></tr><tr><td>保存失败</td><td>先保留页面、下载完整备份，再检查网络并重试保存。</td></tr><tr><td>保存冲突</td><td>不要继续覆盖；先备份本机修改，再读取云端最新版。</td></tr></tbody></table></div>
+<h3>自动保存和保存筛选结果的区别</h3>
+<p>自动保存负责同步日常工作数据，例如导入资料、人工计分、勾选人员、恢复人员。顶部“保存”可用于手动再次提交或重试。</p>
+<p>“保存筛选结果”负责留存本次名单、当时的分数、统计口径和计分规则。只勾选人员或看到“已保存到云端”，并不代表已经建立历史筛选结果。</p>
+<h3>多人使用时</h3>
+<p>第一个网页完成修改并显示“已保存到云端”后，第二个网页需要刷新或读取最新版，才会看到变化。第二个网页若还有未同步的修改，先处理保存或备份，避免直接刷新丢失内容。</p>
+<p>遇到冲突时，按提示下载本机备份、读取最新版，再对照备份补回必要修改。不要直接用整份旧备份覆盖最新数据。</p>
+<h2 id="manualChapter2" class="manual-chapter">导入新同学和补充旧资料</h2>
+<h3>发给学生的填写要求</h3>
+<p>从“资料导入”下载当前模板。一名学生一行，第一条示例应删除或替换；不要把示例当成真实学生提交。尽量填写学号，并保持姓名、班级准确。</p>
+<div class="manual-table-wrap"><table><thead><tr><th scope="col">栏目</th><th scope="col">填写要求与例子</th></tr></thead><tbody><tr><td>获奖情况</td><td>一项一行：2026年｜某大学生创新大赛｜广东省赛｜二等奖。阶段不清楚可写“不清楚”，不要猜。</td></tr><tr><td>参与活动</td><td>一项一行，写日期、活动名称，并说明是参与还是获奖。</td></tr><tr><td>学习或综测排名</td><td>写5/40，表示第5名、共40人；用模板文本单元格，避免变成日期。</td></tr><tr><td>志愿总时长</td><td>只写累计小时数，如15或12.5。</td></tr><tr><td>职务</td><td>写完整组织与岗位，如“学院学生会宣传部负责人”；校级岗位写实际职务。</td></tr><tr><td>旷课 违纪 挂科</td><td>按模板提示如实填写；不清楚的情况先核实。</td></tr></tbody></table></div>
+<p>同一格换行可按 Alt＋Enter，不便换行可用中文分号隔开。学院“部门负责人”对应原办法中的“院级部长”，名称兼容不改变分值。</p>
+<h3>导入前必须看预览</h3>
+<p class="manual-step"><strong>1.</strong><span>进入“资料导入”上传收集表，查看新增、更新、无变化和身份冲突数量。</span></p>
+<p class="manual-step"><strong>2.</strong><span>选择已有批次，或填写新批次名称。批次表示资料来源，不代表最终筛选名单。</span></p>
+<p class="manual-step"><strong>3.</strong><span>逐项核对“更新”的变化内容。姓名、学号或同名同班身份有冲突时，先核实原表，系统不会自动合并。</span></p>
+<p class="manual-step"><strong>4.</strong><span>如决定只导入无冲突的记录，明确勾选跳过冲突；被跳过的行修改后还需重新导入。</span></p>
+<p class="manual-step"><strong>5.</strong><span>确认导入后查看结果卡，按“核对本次待审核材料”或“继续选人筛选”进入下一步。</span></p>
+<h3>给老同学追加材料</h3>
+<p>仍用同一模板，优先填写原学号。没有学号时，可用姓名和班级辅助匹配，但要核实导入预览显示“更新”，避免建立重复档案。</p>
+<p>奖项和活动会追加，完全相同的条目去重；留空栏目保留原资料。排名、职务、志愿总时长等非空栏目会更新原值。原10小时再增加5小时，应填累计15，不能只填5。</p>
+<h2 id="manualChapter3" class="manual-chapter">查看积分和人工审核</h2>
+<h3>查找与查看人员</h3>
+<p class="manual-step"><strong>1.</strong><span>进入“人员与积分”，按姓名、班级、学号搜索，或选择班级。</span></p>
+<p class="manual-step"><strong>2.</strong><span>点击学生，先看总分、分项和待审核状态，再查看原始资料和计分明细。</span></p>
+<p class="manual-step"><strong>3.</strong><span>需要核对某项时，点击对应分项，结合原始材料与学院规则确认。不能仅因分数偏低就补分。</span></p>
+<p>左侧导航可折叠为图标，鼠标滑过图标立即显示板块名称。学生列表可收起；收起后点击“选择学生”重新展开。导航和列表的收起状态只影响当前电脑的显示。</p>
+<h3>单条审核</h3>
+<p class="manual-step"><strong>1.</strong><span>进入“待审核材料”，选择要核对的同学；也可从个人页面打开“待审核材料”标签。</span></p>
+<p class="manual-step"><strong>2.</strong><span>查看完整原文及系统提示原因，必要时让学生补证书、获奖阶段或职务归属。</span></p>
+<p class="manual-step"><strong>3.</strong><span>选择正确分类、级别或等次，核对建议分数，再确认。级别不明时暂留待审核，不要猜测。</span></p>
+<p class="manual-step"><strong>4.</strong><span>确认后检查分项和总分，并等待顶部显示“已保存到云端”。</span></p>
+<p>全国性赛事名称不等于本次获奖为国家级，应按实际获奖阶段判断。学院负责人和误填的学院部长按同一岗位兼容；校级正副职需要分别核对。</p>
+<h3>连续审核</h3>
+<p class="manual-step"><strong>1.</strong><span>在“待审核材料”点击“开始连续审核”。弹窗显示当前学生、材料和本轮进度。</span></p>
+<p class="manual-step"><strong>2.</strong><span>完成分类与分数核对后，点击“确认并继续下一项”，系统保存处理结果并进入下一项。</span></p>
+<p class="manual-step"><strong>3.</strong><span>证据不足时点“暂时跳过”。跳过不会计作确认，材料继续留在待审核中。</span></p>
+<p class="manual-step"><strong>4.</strong><span>需要暂停时点“结束连续审核”或取消。已经确认的结果保留，之后可从剩余待审核材料重新开始。</span></p>
+<p>连续审核期间出现保存冲突时，应先处理冲突。审核进度属于本轮操作提示，不代表所有材料均已审核完成。</p>
+<h3>人工确认后的重算</h3>
+<p>已人工确认的分类与分数会受到保留保护。补充资料或重算后，仍应抽查人工计分与新增材料；发现明显异常时停止批量操作，先下载备份并反馈维护人员。</p>
+<h2 id="manualChapter4" class="manual-chapter">跨批次筛选和留存结果</h2>
+<h3>新老同学一起筛选</h3>
+<p class="manual-step"><strong>1.</strong><span>进入“批次与筛选”。刚导入的本批人员会自动勾选，先检查是否都是本次应参加人员。</span></p>
+<p class="manual-step"><strong>2.</strong><span>切换到历史批次或全部批次，搜索并勾选需要加入的老同学。切换批次不会主动取消已有勾选。</span></p>
+<p class="manual-step"><strong>3.</strong><span>点击“查看完整勾选名单”，核对是否漏人、多选或重复；检查待审核人数。</span></p>
+<p class="manual-step"><strong>4.</strong><span>如看不到预期人员，检查批次、审核状态、分数范围、搜索词及“只看已选”等条件，必要时清空筛选条件。</span></p>
+<p>一个人可参加多次筛选，批次只标记录入来源。“取消勾选”只移出本次名单，“移入人员回收站”则从当前人员库移除，两者不同。</p>
+<h3>先统一材料口径</h3>
+<p>老同学的排名、职务和志愿累计时长可能已经变化，参加新一轮筛选前应确认是否需要补充。所有参选人员要采用学院要求的同一统计时段或累计口径，不能直接比较不同时间范围的材料。</p>
+<h3>保存本次筛选结果</h3>
+<p class="manual-step"><strong>1.</strong><span>在保存区域填写筛选名称，例如“2026年第二批综合筛选”。</span></p>
+<p class="manual-step"><strong>2.</strong><span>填写统一统计口径，例如学院通知的材料起止日期或累计范围；这里的文字说明不会自动过滤旧奖项，需要管理员核对材料。</span></p>
+<p class="manual-step"><strong>3.</strong><span>点击“保存筛选结果”。如仍有待审核人员，认真阅读提示；暂存结果不可当成最终审核结论。</span></p>
+<p class="manual-step"><strong>4.</strong><span>等待顶部“已保存到云端”，再到“历史筛选结果”确认可以找到该次结果。</span></p>
+<h3>选择正确的导出入口</h3>
+<div class="manual-table-wrap"><table><thead><tr><th scope="col">入口</th><th scope="col">导出或查看的范围</th></tr></thead><tbody><tr><td>导出本次勾选结果</td><td>当前选中人员按当前资料计算的结果。</td></tr><tr><td>历史筛选结果中的导出</td><td>保存当时的名单、分数与规则，不随以后修改变化。</td></tr><tr><td>全部积分汇总</td><td>全体在库人员，不能直接当作本次筛选名单。</td></tr><tr><td>个人导出明细</td><td>当前学生的详细积分，便于逐项复核。</td></tr></tbody></table></div>
+<p>人员补充材料后，过去保存的结果不会自动更新。需要新结果时重新核对并保存，或从历史名单重新选择后另存一份。导出Excel后，先核对人数、姓名、总分和待审核状态，再对外使用。</p>
+<h2 id="manualChapter5" class="manual-chapter">回收站 修改记录和备份</h2>
+<h3>移除和恢复人员</h3>
+<p class="manual-step"><strong>1.</strong><span>进入“人员与积分”，选中学生，在“更多操作”点击“移入人员回收站”，核对姓名后确认。</span></p>
+<p class="manual-step"><strong>2.</strong><span>被移除的同学不再参加当前排名，并会从本次已选名单移出；历史结果继续保留。</span></p>
+<p class="manual-step"><strong>3.</strong><span>误操作时进入“人员回收站”，点击“恢复该同学”。恢复只取回该人的档案，不覆盖其他人的最新资料。</span></p>
+<p class="manual-step"><strong>4.</strong><span>恢复后如果需要参加本次筛选，应重新勾选。若系统提示学号或身份冲突，先核对，不要重复创建或覆盖。</span></p>
+<p>日常移入回收站不再自动下载整份备份。只有在回收站点击“永久删除”并确认时，系统才会先触发下载备份。确认备份文件确实可用，再执行后续重要操作。</p>
+<h3>查看关键修改记录</h3>
+<p>左侧“修改记录”可查看启用后的人员新增、移入回收站、恢复、永久删除、资料与人工计分、规则变化。展开记录可看修改前后内容，最近保留500条。</p>
+<p>共用账号统一记为“管理员”，不能据此确定是哪位老师操作。记录用于日常核对，不提供任意字段的一键撤销；旧数据启用前的修改不会补出历史。</p>
+<h3>下载完整备份</h3>
+<p>在“备份与恢复”点击“下载完整备份”，保存生成的JSON文件。备份包括人员、回收站、修改记录、批次、勾选名单、历史结果和规则。建议保留日期，放在学院允许的受控位置，不要公开传播学生资料。</p>
+<p>批量导入、规则调整、正式上线及重要结果确认前后，均可另留一份完整备份。Excel结果表便于查看，不能替代JSON完整备份。</p>
+<h3>恢复完整备份前先判断</h3>
+<p>恢复完整备份会替换当前工作数据，不会自动合并。系统会先触发下载恢复前备份；多人使用时要先协调，避免覆盖别人刚保存的内容。</p>
+<p>只误删一个学生，优先使用回收站；只有需要整体恢复时才使用完整备份。不要为找回一项内容就直接恢复整份旧数据。</p>
+<h3>评分标准</h3>
+<p>“评分标准”用于核对学院现行办法。普通材料录入、负责人名称兼容及人工审核不需要改动规则。确需调整时，先确认学院依据、备份并核对影响；未经授权不要随意修改分值或上限。</p>
+<h2 id="manualChapter6" class="manual-chapter">常见问题和交接检查</h2>
+<h3>为什么另一网页看不到修改</h3>
+<p>先检查修改所在网页是否显示“已保存到云端”，再让另一网页刷新或读取最新版。两边都有修改时，应先保存或备份；发生冲突按提示处理，不能把本机保存等同于共享成功。</p>
+<h3>为什么刷新后又出现登录页</h3>
+<p>登录会话过期、身份验证失败、无法恢复或浏览器不允许保留会话时，会要求重新登录。重新输入账号密码即可；不要因此上传旧备份。数据是否保存，要看刷新前的云端保存状态。</p>
+<h3>首次打开是否要恢复历史数据</h3>
+<p>普通管理员直接登录。“管理员恢复历史数据”是特殊维护入口，不是常规使用步骤。新电脑不需要重复恢复，遇到提示请先联系维护人员。</p>
+<h3>导入后分数少了或待审核增多</h3>
+<p>先检查原文是否写清获奖阶段、职务组织、排名人数和累计志愿时长，再到待审核材料查看原因。原来累计15小时若误填为5，会更新成5；不能只填写本次新增小时。不要为了消除待审核而随意选级别。</p>
+<h3>筛选结果为什么没有随新材料变化</h3>
+<p>历史结果保留保存当时的状态。要得到本次最新结果，应重新核对当前人员资料、勾选名单和统一口径，再保存一份新的筛选结果。</p>
+<h3>误删后为什么没有自动下载备份</h3>
+<p>当前人员先进入回收站，可单独恢复，因此日常移除不会反复下载完整备份。永久删除才触发备份下载；历史筛选结果仍会保留。</p>
+<h3>管理员交接前逐项确认</h3>
+<p class="manual-step"><strong>1.</strong><span>确认接手人拿到正确的正式网址与账号，不在聊天群公开发送密码。</span></p>
+<p class="manual-step"><strong>2.</strong><span>核对本次批次、统一统计口径、已选人数和未处理的审核材料。</span></p>
+<p class="manual-step"><strong>3.</strong><span>确认需要留存的筛选结果已保存，导出人数与名单一致。</span></p>
+<p class="manual-step"><strong>4.</strong><span>下载一份完整JSON备份，说明保存位置、日期和适用范围。</span></p>
+<p class="manual-step"><strong>5.</strong><span>告知尚未处理的冲突、异常材料和回收站事项；退出公用电脑上的账号。</span></p>
+<p>日常结束前：看保存状态、确认历史结果、妥善保管备份。遇到异常先停止批量修改，保留现象和时间，再联系维护人员。</p><p class="manual-version-note">本弹窗为系统内置手册。飞书在线修订后，请由维护人员同步更新内置内容。</p></article></div></dialog>
+<dialog id="scoringRulesDialog" class="manual-dialog" aria-labelledby="scoringRulesTitle"><header class="manual-dialog-header"><div><span>学院评分文件</span><h2 id="scoringRulesTitle">评分细则</h2></div><div class="manual-header-actions"><a class="btn" href="assets/scoring-rules.docx" download>下载原文件</a><button type="button" id="scoringRulesClose" class="btn rules-close" aria-label="关闭评分细则">×</button></div></header><div class="manual-dialog-body"><nav class="manual-toc" aria-label="评分细则目录"><button type="button" data-rules-target="rulesChapter1">一、实施背景</button><button type="button" data-rules-target="rulesChapter2">二、核心目标</button><button type="button" data-rules-target="rulesChapter3">三、积分指标体系</button><button type="button" data-rules-target="rulesChapter4">四、结果应用</button><button type="button" data-rules-target="rulesChapter5">五、动态运行保障</button><button type="button" data-rules-target="rulesChapter6">六、附则</button></nav><article id="rulesDialogArticle" tabindex="0" aria-label="评分文件原文"><p class="rules-reading-note"><strong>查阅说明</strong>　以下保留学院原文件条文及表格。本页面只供查阅，不会修改系统参数。原文“一票否决”条款保留展示，系统不自动执行该功能。原文与当前参数有差异时，请管理员核实学院现行口径后处理。</p><p>国际交流学院</p>
+<p>党员积分制量化考核实施方案（修订版）</p>
+<h2 id="rulesChapter1" class="manual-chapter">一、实施背景</h2>
+<p>为贯彻落实习近平新时代中国特色社会主义思想，响应全面从严治党要求，规范国际教育学院学生党员发展工作，持续增强党员的先进性和模范性，特制定本党员积分制实施方案。本方案以&quot;纪律、荣耀、回归&quot;为主题，结合国际教育学院的国际化特色，引导学生从思想入党到行动入党，做到组织上过硬、信念上坚定、肩负民族复兴重任、具备全球视野和跨文化沟通能力的新时代青年。</p>
+<p>本方案旨在通过制度化、规范化、常态化、可持续化的积分管理体系，推进公开透明和高质量的学生党员发展工作机制。</p>
+<h2 id="rulesChapter2" class="manual-chapter">二、核心目标</h2>
+<p>通过制度化、规范化的积分管理体系，覆盖党员发展全过程（入党申请人→入党积极分子→发展对象→预备党员→正式党员），建立涵盖学业发展、思想成长、实践锻炼、纪律约束的系统化、规范化、可持续化的积分考核机制，确保党员发展的公平、公正、公开，同时注重国际教育学院的多元文化特色，培养具有国际视野和家国情怀的优秀学生党员。</p>
+<h2 id="rulesChapter3" class="manual-chapter">三、积分指标体系</h2>
+<p>积分体系采用100分基础分制，其中学业能力满分40分，党性成长满分60分，纪律约束为扣分项。积分结果作为党员发展、转预、转正、评优评先的重要依据。</p>
+<h3>（一）学业能力（总分不超过40分）</h3>
+<div class="manual-table-wrap"><table><thead><tr><th scope="col">项目</th><th scope="col">指标细则</th><th scope="col">分值说明</th></tr></thead><tbody><tr><td>学业成绩</td><td>学生学业成绩排名</td><td>年级前5%：6分<br>前10%：3分<br>前20%：1分</td></tr><tr><td>综合测评</td><td>学生综合测评排名</td><td>年级前5%：6分<br>前10%：3分<br>前20%：1分</td></tr><tr><td>社会工作</td><td>担任学生干部职务<br>（一人多职取最高分，不累加）</td><td>校级0-5分，院级0-4分，班级0-3分，视具体表现加分，同时担任多职位不累计</td></tr><tr><td>学科竞赛<br>（含论文、专利）</td><td>学科竞赛获奖、发表论文、获得专利<br>（同一赛事/成果取最高等级，不重复计分；团体奖与个人奖同等分值）</td><td>国家级：8分<br>省级：6分<br>市级：4分<br>校级/协会级：3分<br>院级：2分<br><br>论文/专利等级对应：<br>SCI/EI期刊/核心期刊/发明专利→国家级<br>普通期刊/会议论文/实用新型专利→省级<br>外观设计专利/软件著作权→校级/协会级</td></tr><tr><td>创新创业</td><td>创新创业类竞赛获奖</td><td>国家级：8分<br>省级：6分<br>市级：4分<br>校级/协会级：3分<br>院级：2分</td></tr><tr><td>奖学金/荣誉</td><td>获得奖学金、荣誉称号、体育赛事获奖</td><td>国家奖学金：8分<br>国家励志奖学金：6分<br>校一等奖学金：4分<br>校二等奖学金：3分<br>校三等奖学金：2分<br>优秀团员/团干/学生骨干/三好学生：3分<br>优秀学员：2分<br>志愿者之星/优秀志愿者：2分<br>标兵/十佳：4分<br>国家级：7分<br>省级：5分<br>市级：3分<br>校级/协会级：2分<br>院级：1分</td></tr></tbody></table></div>
+<h3>（二）党性成长（总分不超过60分）</h3>
+<div class="manual-table-wrap"><table><thead><tr><th scope="col">模块</th><th scope="col">指标细则</th><th scope="col">分值说明</th></tr></thead><tbody><tr><td>党课学习</td><td>作为党课的组织管理者宣讲者<br>（含党课培训中组织的参观学习活动）</td><td>每次5分</td></tr><tr><td>志愿服务</td><td>参加各级各类志愿服务活动<br>（按将成为入党积极分子以来总活动服务时长计分，总分上限8分）</td><td>总服务时长×0.25（每小时）</td></tr><tr><td>红色活动</td><td>参加党团活动：升旗仪式、植树活动、敬老院慰问、祭扫烈士陵园等<br>参观红色教育基地：纪念馆、博物馆、党史馆、革命旧址等<br>参加思想政治教育：形势政策课、主题团日、主题班会、青年大学习等</td><td>每次3分<br>（党课培训中组织的参观已计入党课学习，不重复计算）<br><br>线上红色资源学习（学习强国、红色影视、党史读物等）：每次1分，累计不超过5分</td></tr><tr><td>社会实践</td><td>参与&quot;三下乡&quot;、乡村振兴、百千万工程、千股工程、双百行动、支教、调研等社会实践活动</td><td>参与基础分：每次5分<br><br>成果获奖（同一项目取最高等级）：<br>国家级：8分<br>省级：6分<br>市级：4分<br>校级/协会级：3分<br>院级：2分</td></tr><tr><td>国际交流</td><td>参加中外文化交流活动、国际学术会议、留学生交流活动等</td><td>每次2分<br>总分上限8分</td></tr><tr><td>同辈互助</td><td>参加迎新活动、运动会、晚会、讲座（含学术讲座）、献血、校园巡逻、食堂协助、查寝、体检协助、职业规划活动、社团活动、体育比赛、文艺演出、辩论赛、演讲比赛等</td><td>每次2分</td></tr></tbody></table></div>
+<p>成果加分要求：需提交证书、证明、聘书、课题报告或发表期刊等佐证材料。</p>
+<h3>（三）纪律约束（扣分项）</h3>
+<div class="manual-table-wrap"><table><thead><tr><th scope="col">扣分项目</th><th scope="col">扣分说明</th></tr></thead><tbody><tr><td>缺勤</td><td>每次扣2分；迟到累计3次按1次缺勤计</td></tr><tr><td>不当言论</td><td>发表不符合事实言论、传播谣言等，视情节扣2-5分</td></tr><tr><td>挂科</td><td>每门扣3分；挂科超过3门，暂停或取消发展党员资格</td></tr><tr><td>无故缺席</td><td>无故缺席组织活动，每次扣2分</td></tr><tr><td>网络违纪</td><td>浏览非法网站、传播有害信息等，扣2-5分</td></tr><tr><td>纪律处分</td><td>通报批评：扣5分<br>警告：扣10分<br>严重警告/记过及以上：扣20分</td></tr><tr><td>一票否决</td><td>违反政治纪律和政治规矩、参加非法组织、有重大违纪违法行为等，扣除全部积分，取消发展资格<br>投诉核实流程：提交投诉材料→学院党委核实→必要时组织听证</td></tr></tbody></table></div>
+<h2 id="rulesChapter4" class="manual-chapter">四、结果应用</h2>
+<div class="manual-table-wrap"><table><thead><tr><th scope="col">应用场景</th><th scope="col">说明</th></tr></thead><tbody><tr><td>发展/转正</td><td>积分结果作为入党积极分子确定、发展对象确定、预备党员转正的重要参考；积分过低者暂缓发展或转正</td></tr><tr><td>星级评定</td><td>★★★★★（5星）：积分排名前10%，优先推荐校级及以上荣誉<br>★★★★（4星）：积分排名前20%，可参与学院重点项目<br>★★及以下：接受警示谈话，制定改进计划</td></tr><tr><td>动态公示</td><td>每学期通过学院官网、微信公众号公示积分明细，接受师生监督</td></tr><tr><td>申诉机制</td><td>学生对积分有异议可向学院党委提出申诉，5个工作日内处理答复</td></tr></tbody></table></div>
+<h2 id="rulesChapter5" class="manual-chapter">五、动态运行保障</h2>
+<p>1. 评估与反馈：每学期末对积分制进行评估，收集党员、支部干部意见，适时调整指标和分值。</p>
+<p>2. 特殊情况处理：因病、因事等不可抗力无法参加活动的，积分不扣除。</p>
+<p>3. 培训与指导：对党支部干部进行积分制操作培训，确保评分标准统一；每学期开展积分制工作交流会，收集党员意见优化方案。</p>
+<h2 id="rulesChapter6" class="manual-chapter">六、附则</h2>
+<p>1. 本方案由国际教育学院党委负责解释。</p>
+<p>2. 本方案适用对象为国际教育学院党员发展过程中的全体学生。</p>
+<p>3. 本方案积分起算时间确定为入党申请日期。</p>
+<p>4. 在院内成为积极分子后，但截至2024年9月1日前尚未成为国际教育学院党委在册学生，期间提交的材料计分按原分值的60%统计。</p>
+<p>5. 本方案自发布之日起施行。</p></article></div></dialog>
+<script src="scoring-rules-dialog.js?v=rules-reference-19"></script>
+<script src="manual-dialog.js?v=manual-dialog-18"></script>
 <script src="cloudbase.full.js"></script>
-<script src="app.js"></script>
+<script src="batch-core.js?v=workspace-2"></script>
+<script src="admin-core.js?v=admin-tools-16"></script>
+<script src="cloud-sync.js?v=workflow-1"></script>
+<script src="app.js?v=admin-tools-16"></script>
+<script src="batches.js?v=import-receipt-14"></script>
+<section id="workspaceRecycle" class="hide"></section><section id="workspaceAudit" class="hide"></section>
+<script src="workspace.js?v=admin-tools-16"></script>
+<script src="admin-tools.js?v=admin-tools-16"></script>
+<script>document.getElementById("loginAccountPwd").addEventListener("keydown",function(e){if(e.key==="Enter")tryLogin();});</script>
 <script>
 document.getElementById('btnMore').addEventListener('click',function(e){e.stopPropagation();document.getElementById('topbarMoreMenu').classList.toggle('open');});
 document.addEventListener('click',function(e){if(!e.target.closest('.topbar-more'))document.getElementById('topbarMoreMenu').classList.remove('open');});
